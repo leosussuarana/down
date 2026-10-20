@@ -124,14 +124,11 @@ def obter_seletor_formato_audio(url: str) -> str:
 def gerar_candidatos_url_hls(url: str) -> list:
     candidatos = [url]
     
-    # 1. Remove sufixos extras que não fazem parte da assinatura HMAC da CDN (ex: &youtubedubbing=true)
     url_sem_dub = re.sub(r'([?&])youtubedubbing=true(&?)', lambda m: m.group(1) if m.group(2) else '', url)
     url_sem_dub = url_sem_dub.rstrip('?&')
     if url_sem_dub and url_sem_dub not in candidatos:
         candidatos.append(url_sem_dub)
 
-    # 2. Se for sub-playlist de faixa específica (ex: 4RzlMd0oLV-1763060960000-audio=73632-video=261153.m3u8),
-    # gera variações apontando para o manifesto mestre na mesma pasta /hls/ mantendo a query string de autenticação
     for u_base in list(candidatos):
         if "/hls/" in u_base and ("audio=" in u_base or "video=" in u_base):
             partes = u_base.split("?", 1)
@@ -140,7 +137,6 @@ def gerar_candidatos_url_hls(url: str) -> list:
             pasta_hls = caminho_url.rsplit("/", 1)[0]
             nome_sub = caminho_url.rsplit("/", 1)[1]
             
-            # Extrai timestamp se existir (ex: -1763060960000-)
             m_ts = re.search(r'-(\d{10,15})-', nome_sub)
             if m_ts:
                 ts = m_ts.group(1)
@@ -858,9 +854,103 @@ class ModalConfigurar:
         janela.deiconify()
 
 #====================================================
-# MODAL: SOBRE A MARCA (EASTER EGG - TERMINAL HACKER) (MANTIDO INTACTO)
+# FUNÇÕES AUXILIARES PARA O EASTER EGG (v6.4.0)
+#====================================================
+def _resource_path(nome_arquivo: str) -> str:
+    base = PASTA_BUNDLE if getattr(sys, 'frozen', False) else PASTA_APP
+    return os.path.join(base, nome_arquivo)
+
+def _duracao_wav_ms(caminho: str) -> int:
+    try:
+        import wave
+        with wave.open(caminho, 'rb') as w:
+            frames = w.getnframes()
+            rate = w.getframerate()
+            if rate > 0:
+                return int((frames / rate) * 1000)
+    except Exception:
+        pass
+    return 4000
+
+#====================================================
+# MODAL: SOBRE A MARCA (EASTER EGG - TERMINAL HACKER)
 #====================================================
 class ModalMarca:
+    # Roteiro passo a passo corrigido e sincronizado
+    ROTEIRO = [
+        # 1. Inicia o terminal
+        {"acao": "digitar", "texto": "> inicializando interface de comando...", "tipo": "normal"},
+        {"acao": "pausa", "ms": 800},
+        
+        # 2. Primeira tentativa de conexão
+        {"acao": "digitar", "texto": "> pppd call provedor", "tipo": "cmd"},
+        {"acao": "som_espera", "som": "modem_ocupado.wav", "texto_pos": "> [ERRO] linha ocupada. handshake falhou."},
+        {"acao": "pausa", "ms": 1000},
+        
+        # 3. Reclamação (agora faz sentido, pois a primeira falhou)
+        {"acao": "digitar", "texto": "> droga... hoje está difícil conectar... vou tentar uma nova rota...", "tipo": "cmd"},
+        {"acao": "digitar", "texto": "> connect --proto=slip --retry", "tipo": "cmd"},
+        {"acao": "som_espera", "som": "modem_conectado.wav", "texto_pos": "> [OK] conexão estabelecida na porta 443."},
+        {"acao": "pausa", "ms": 1000},
+        
+        # 4. Tenta baixar o vídeo e a ligação cai
+        {"acao": "digitar", "texto": "> wget https://hotmart.com/aulas/curso-x/video-aula-01.mp4", "tipo": "cmd"},
+        {"acao": "som_espera", "som": "modem_desconectado.wav", "texto_pos": "> [ERRO FATAL] conexão derrubada. bloqueio de servidor detectado."},
+        {"acao": "pausa", "ms": 1200},
+        
+        # 5. Frustração e Busca pela solução
+        {"acao": "digitar", "texto": "> o firewall deles é bom... preciso de uma solução infalível.", "tipo": "cmd"},
+        {"acao": "pausa", "ms": 1000},
+        
+        # 6. Conecta no servidor do Down
+        {"acao": "digitar", "texto": "> connect --target=www.sussuarana.com --bypass-drm", "tipo": "cmd"},
+        {"acao": "som_espera", "som": "modem_conectado.wav", "texto_pos": "> [OK] túnel criptografado estável."},
+        {"acao": "pausa", "ms": 800},
+        
+        # 7. Acessa os apps
+        {"acao": "digitar", "texto": "> firefox https://www.sussuarana.com/_apps", "tipo": "cmd"},
+        {"acao": "digitar", "texto": "> ls /apps/disponiveis", "tipo": "cmd"},
+        {"acao": "digitar", "texto": f"> down.exe       Pronto para uso", "tipo": "ok"},
+        {"acao": "pausa", "ms": 500},
+        
+        # 8. Baixa vídeo com progresso mais lento e detalhado
+        {"acao": "digitar", "texto": "> ./down.exe --url=https://hotmart.com/aulas/curso-x/video-aula-01", "tipo": "cmd"},
+        {"acao": "progresso", "som": "sucesso.wav", "texto_pos": "> [OK] vídeo baixado: aula01.mp4 (245 MB)"},
+        {"acao": "pausa", "ms": 1000},
+        
+        # 9. Baixa áudio com progresso
+        {"acao": "digitar", "texto": "> ./down.exe --url=https://kiwify.com/curso-y/audio-aula-01", "tipo": "cmd"},
+        {"acao": "progresso", "som": "sucesso.wav", "texto_pos": "> [OK] áudio baixado: aula01.mp3 (12 MB)"},
+        {"acao": "pausa", "ms": 1000},
+        
+        # 10. Sucesso Final
+        {"acao": "digitar", "texto": "> ATÉ QUE ENFIM! FUNCIONOU PERFEITAMENTE!", "tipo": "ok"},
+        {"acao": "pausa", "ms": 1500},
+        
+        # 11. Desconecta (Som de desligamento imediato)
+        {"acao": "digitar", "texto": "> ./down.exe --logout", "tipo": "cmd"},
+        {"acao": "digitar", "texto": "> exit", "tipo": "cmd"},
+        {"acao": "som_espera", "som": "modem_desconectado.wav", "texto_pos": "> conexão encerrada pelo usuário com sucesso."},
+        {"acao": "pausa", "ms": 1500},
+        
+        # 12. Tela Final de Informações (Loop indication)
+        {"acao": "limpar_tela"},
+        {"acao": "digitar", "texto": "--- DOWN v[VERSAO] ---", "tipo": "ok"},
+        {"acao": "digitar", "texto": "Desenvolvido por Swammy Léo Sussuarana", "tipo": "normal"},
+        {"acao": "digitar", "texto": "Sistemas de burla de DRM e extração de mídia.", "tipo": "normal"},
+        {"acao": "pausa", "ms": 1000},
+        {"acao": "digitar", "texto": "> reiniciando simulação em 5 segundos...", "tipo": "cmd"},
+        {"acao": "pausa", "ms": 5000}
+    ]
+
+    CORES = {
+        "cmd": COR_VERDE_MATRIX,
+        "erro": COR_VERMELHO,
+        "ok": COR_AMARELO,
+        "link": "#3B82F6",
+        "normal": COR_BRANCO
+    }
+
     @staticmethod
     def abrir(parent):
         janela = tk.Toplevel(parent)
@@ -872,182 +962,182 @@ class ModalMarca:
         janela.transient(parent)
         janela.attributes("-topmost", True)
         janela.grab_set()
-        
+
+        # --- Canvas do logo ---
         canvas_logo = tk.Canvas(janela, width=720, height=260, bg=COR_FUNDO, highlightthickness=0)
         canvas_logo.pack(fill=tk.X)
-        
+
         caminho_logo = obter_caminho_logo_png()
         try:
             img_pil_original = Image.open(caminho_logo).convert("RGBA")
             img_pil_original = img_pil_original.resize((250, 250), Image.Resampling.LANCZOS)
         except Exception:
-            img_pil_original = Image.new("RGBA", (250, 250), (255,215,0,255))
-            
+            img_pil_original = Image.new("RGBA", (250, 250), (255, 215, 0, 255))
+
         tk_img = ImageTk.PhotoImage(img_pil_original)
         logo_id = canvas_logo.create_image(360, 130, image=tk_img)
-        
         canvas_logo.create_rectangle(10, 10, 710, 250, outline=COR_AMARELO, width=2)
-        
-        angulo = 0.0
-        rodando = True
-        
+
+        angulo = [0.0]
+        rodando = [True]
+
         def animar_logo():
-            nonlocal angulo, tk_img, rodando
-            if not rodando: return
-            angulo = (angulo + 10) % 360
-            radianos = math.radians(angulo)
-            escala_x = abs(math.cos(radianos))
-            largura_atual = max(1, int(250 * escala_x))
-            img_red = img_pil_original.resize((largura_atual, 250), Image.Resampling.LANCZOS)
-            tk_img = ImageTk.PhotoImage(img_red)
-            canvas_logo.itemconfig(logo_id, image=tk_img)
+            if not rodando[0]: return
+            angulo[0] = (angulo[0] + 10) % 360
+            rad = math.radians(angulo[0])
+            largura = max(1, int(250 * abs(math.cos(rad))))
+            img_red = img_pil_original.resize((largura, 250), Image.Resampling.LANCZOS)
+            nova_tk = ImageTk.PhotoImage(img_red)
+            canvas_logo.itemconfig(logo_id, image=nova_tk)
+            canvas_logo.image = nova_tk
             janela.after(40, animar_logo)
-            
-        canvas_logo.tag_bind(logo_id, "<Button-1>", lambda e: janela.destroy())
-        
+
+        # --- Títulos ---
         frame_titulos = tk.Frame(janela, bg=COR_FUNDO)
         frame_titulos.pack(fill=tk.X, pady=(5, 10))
-        
         tk.Label(frame_titulos, text=f"DOWN {VERSAO_ATUAL}", font=("Segoe UI", 20, "bold"), bg=COR_FUNDO, fg=COR_AMARELO).pack()
-        tk.Label(frame_titulos, text="Copyright (C) Out/2026 Swammy Léo Sussuarana", font=("Segoe UI", 8), bg=COR_FUNDO, fg=COR_BRANCO).pack(pady=(0, 0))
-        
+        tk.Label(frame_titulos, text="Copyright (C) Out/2026 Swammy Léo Sussuarana", font=("Segoe UI", 8), bg=COR_FUNDO, fg=COR_BRANCO).pack()
+
+        # --- Canvas do terminal ---
         canvas_terminal = tk.Canvas(janela, width=720, height=180, bg=COR_FUNDO, highlightthickness=0)
         canvas_terminal.pack(fill=tk.BOTH, expand=True)
-        
+
         frame_btn = tk.Frame(janela, bg=COR_FUNDO)
         frame_btn.pack(fill=tk.X, pady=15)
-        tk.Button(frame_btn, text="VOLTAR", command=janela.destroy, font=("Segoe UI", 10, "bold"), bg=COR_AMARELO, fg=COR_PRETO, activebackground=COR_AMARELO_HOVER, relief=tk.FLAT, cursor="hand2", pady=6, padx=40).pack()
-        
-        mensagens = [
-            ("> Iniciando protocolo de conexão segura...", COR_AMARELO, None),
-            ("> Carregando módulos do sistema.", COR_VERDE_MATRIX, None),
-            ("> [OK] Arquitetura base: Tkinter + PIL", COR_BRANCO, None),
-            ("> O DOWN utiliza motores de código aberto para garantir máxima performance.", COR_CINZA_TEXTO, None),
-            ("> yt-dlp: Extração de mídia de alta velocidade.", COR_BRANCO, None),
-            ("> FFmpeg: Processamento e conversão de áudio/vídeo.", COR_BRANCO, None),
-            ("> Deno: Runtime JavaScript para desafios complexos.", COR_BRANCO, None),
-            ("> Nenhuma cobrança oculta. Nenhuma trava. 100% Gratuito.", COR_AMARELO, None),
-            ("> Atualizações sempre disponíveis em nosso repositório:", COR_VERDE_MATRIX, None),
-            ("> Clique aqui: github.com/swammy/down/releases", "#3B82F6", "github"), 
-            ("> Fim da transmissão de dados.", COR_VERMELHO, None),
-            ("> Conexão encerrada.", COR_VERMELHO, None)
-        ]
-        
-        linha_atual_idx = 0
+        tk.Button(frame_btn, text="VOLTAR", command=lambda: on_close(), font=("Segoe UI", 10, "bold"), bg=COR_AMARELO, fg=COR_PRETO, activebackground=COR_AMARELO_HOVER, relief=tk.FLAT, cursor="hand2", pady=6, padx=40).pack()
+
+        # --- Estado da máquina ---
+        estado = {"passo_idx": 0, "ativos": True, "afters": []}
         linhas_na_tela = []
         y_inicial = 20
-        espacamento_linha = 22
-        
-        terminal_ativo = True
-        
-        def digitar_texto(texto, cor, tag_link, callback_fim):
-            if not terminal_ativo: return
-            
-            texto_id = canvas_terminal.create_text(
-                20, y_inicial + (len(linhas_na_tela) * espacamento_linha),
-                text="", anchor="nw", font=("Consolas", 10), fill=cor
-            )
-            
-            if tag_link:
-                canvas_terminal.tag_bind(texto_id, "<Button-1>", lambda e: webbrowser.open("https://github.com"))
-                canvas_terminal.itemconfig(texto_id, activefill=COR_AMARELO)
-            
-            linhas_na_tela.append(texto_id)
-            
-            def _type_char(idx):
-                if not terminal_ativo: return
-                if idx <= len(texto):
-                    canvas_terminal.itemconfig(texto_id, text=texto[:idx])
-                    AudioNostalgia.tocar_tecla()
-                    janela.after(35, lambda: _type_char(idx + 1))
-                else:
-                    piscar_cursor(texto_id, texto, callback_fim)
-                    
-            _type_char(0)
+        espacamento = 22
+        max_linhas = 3
 
-        def piscar_cursor(texto_id, texto_completo, callback_fim):
-            if not terminal_ativo: return
-            
-            bbox = canvas_terminal.bbox(texto_id)
-            if not bbox: return
-            
-            cursor_x = bbox[2] + 2
-            cursor_y = bbox[1]
-            
-            cursor_id = canvas_terminal.create_rectangle(
-                cursor_x, cursor_y, cursor_x + 8, cursor_y + 14, fill=COR_VERDE_MATRIX, outline=""
-            )
-            
-            piscadas = 0
-            def _piscar():
-                nonlocal piscadas
-                if not terminal_ativo: return
-                if piscadas < 6: 
-                    cor = COR_VERDE_MATRIX if piscadas % 2 == 0 else COR_FUNDO
-                    canvas_terminal.itemconfig(cursor_id, fill=cor)
-                    piscadas += 1
-                    janela.after(250, _piscar)
-                else:
-                    canvas_terminal.delete(cursor_id)
-                    callback_fim()
-            
-            _piscar()
+        def agendar(ms, fn):
+            if not estado["ativos"]: return
+            aid = janela.after(ms, fn)
+            estado["afters"].append(aid)
 
-        def proxima_linha():
-            nonlocal linha_atual_idx
-            if not terminal_ativo: return
+        def limpar_afters():
+            for aid in estado["afters"]:
+                try: janela.after_cancel(aid)
+                except: pass
+            estado["afters"].clear()
+
+        def tocar_wav(nome):
+            if not winsound or not nome: return
+            caminho = _resource_path(nome)
+            if not os.path.exists(caminho): return
+            try: winsound.PlaySound(caminho, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            except: pass
+
+        # --- Funções de desenho ---
+        def adicionar_linha(texto, cor, piscar=False):
+            if len(linhas_na_tela) >= max_linhas:
+                primeiro = linhas_na_tela.pop(0)
+                canvas_terminal.delete(primeiro)
+                for i, item in enumerate(linhas_na_tela):
+                    canvas_terminal.coords(item, 20, y_inicial + (i * espacamento))
             
-            if linha_atual_idx >= len(mensagens):
-                janela.after(2000, resetar_terminal)
-                return
+            y = y_inicial + (len(linhas_na_tela) * espacamento)
+            item = canvas_terminal.create_text(20, y, text=texto, anchor="nw", font=("Consolas", 10), fill=cor)
+            linhas_na_tela.append(item)
+            return item
+
+        def animar_digitacao(texto, cor, callback_fim):
+            item = adicionar_linha("", cor)
+            caminho_teclado = _resource_path("teclado.wav")
+            
+            def _type(idx):
+                if not estado["ativos"]: return
                 
-            texto, cor, link = mensagens[linha_atual_idx]
-            linha_atual_idx += 1
-            
-            if len(linhas_na_tela) == 3:
-                rolar_para_cima(lambda: digitar_texto(texto, cor, link, proxima_linha))
-            else:
-                digitar_texto(texto, cor, link, proxima_linha)
+                if idx == 0 and winsound and os.path.exists(caminho_teclado):
+                    winsound.PlaySound(caminho_teclado, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP)
 
-        def rolar_para_cima(callback_apos_rolar):
-            if not terminal_ativo: return
-            
-            def _animate_scroll(step):
-                if not terminal_ativo: return
-                if step <= 5:
-                    for item in linhas_na_tela:
-                        canvas_terminal.move(item, 0, -espacamento_linha / 5)
-                    janela.after(30, lambda: _animate_scroll(step + 1))
+                if idx <= len(texto):
+                    canvas_terminal.itemconfig(item, text=texto[:idx])
+                    agendar(40, lambda: _type(idx + 1)) 
                 else:
-                    primeira = linhas_na_tela.pop(0)
-                    canvas_terminal.delete(primeira)
-                    callback_apos_rolar()
-                    
-            _animate_scroll(0)
+                    if winsound: winsound.PlaySound(None, winsound.SND_PURGE)
+                    callback_fim()
+            _type(0)
 
-        def resetar_terminal():
-            nonlocal linha_atual_idx
-            if not terminal_ativo: return
-            canvas_terminal.delete("all")
-            linhas_na_tela.clear()
-            linha_atual_idx = 0
-            AudioNostalgia.tocar_modem()
-            janela.after(1000, proxima_linha)
+        def animar_progresso(callback_fim):
+            import random
+            item = adicionar_linha("> Estabelecendo fluxo de dados... 0%", COR_AMARELO)
+            
+            def _prog(pct):
+                if not estado["ativos"]: return
+                if pct < 100:
+                    canvas_terminal.itemconfig(item, text=f"> Baixando fragmentos... {pct}%")
+                    # Incremento aleatório para simular um download real
+                    passo = random.randint(4, 15)
+                    agendar(150, lambda: _prog(min(100, pct + passo)))
+                else:
+                    canvas_terminal.itemconfig(item, text="> Processamento 100% concluído.")
+                    callback_fim()
+            _prog(0)
+
+        # --- Máquina de estados ---
+        def proximo_passo():
+            if not estado["ativos"]: return
+            if estado["passo_idx"] >= len(ModalMarca.ROTEIRO):
+                estado["passo_idx"] = 0
+                canvas_terminal.delete("all")
+                linhas_na_tela.clear()
+                agendar(1000, proximo_passo) # Loop
+                return
+
+            passo = ModalMarca.ROTEIRO[estado["passo_idx"]]
+            estado["passo_idx"] += 1
+
+            if passo["acao"] == "digitar":
+                cor = ModalMarca.CORES.get(passo.get("tipo", "cmd"), COR_BRANCO)
+                # Substitui a tag [VERSAO] pela versão real em tempo de execução
+                texto_final = passo["texto"].replace("[VERSAO]", VERSAO_ATUAL)
+                animar_digitacao(texto_final, cor, lambda: agendar(200, proximo_passo))
+            
+            elif passo["acao"] == "limpar_tela":
+                canvas_terminal.delete("all")
+                linhas_na_tela.clear()
+                agendar(200, proximo_passo)
+
+            elif passo["acao"] == "pausa":
+                agendar(passo.get("ms", 1000), proximo_passo)
+            
+            elif passo["acao"] == "som_espera":
+                tocar_wav(passo["som"])
+                dur = _duracao_wav_ms(_resource_path(passo["som"]))
+                def apos_som():
+                    if passo.get("texto_pos"):
+                        cor_pos = COR_VERMELHO if "[ERRO" in passo["texto_pos"] else (COR_AMARELO if "[OK]" in passo["texto_pos"] else COR_VERDE_MATRIX)
+                        adicionar_linha(passo["texto_pos"], cor_pos)
+                    agendar(1000, proximo_passo)
+                agendar(dur + 500, apos_som)
+            
+            elif passo["acao"] == "progresso":
+                animar_progresso(lambda: [
+                    tocar_wav(passo["som"]),
+                    adicionar_linha(passo["texto_pos"], COR_AMARELO),
+                    agendar(1500, proximo_passo)
+                ])
+
+        def on_close():
+            estado["ativos"] = False
+            rodando[0] = False
+            limpar_afters()
+            try:
+                if winsound: winsound.PlaySound(None, winsound.SND_PURGE)
+            except: pass
+            try: janela.destroy()
+            except: pass
+
+        canvas_logo.tag_bind(logo_id, "<Button-1>", lambda e: on_close())
+        janela.protocol("WM_DELETE_WINDOW", on_close)
 
         animar_logo()
-        AudioNostalgia.tocar_modem()
-        janela.after(500, proxima_linha)
-        
-        def on_close():
-            nonlocal terminal_ativo, rodando
-            terminal_ativo = False
-            rodando = False
-            janela.destroy()
-            
-        janela.protocol("WM_DELETE_WINDOW", on_close)
-        canvas_logo.tag_bind(logo_id, "<Button-1>", lambda e: on_close())
-        
         janela.deiconify()
+        agendar(1000, proximo_passo)
 
 #====================================================
 # SPLASH SCREEN COM ANIMAÇÃO 3D FAKE E ATUALIZAÇÃO (MANTIDA INTACTA)
@@ -1360,9 +1450,9 @@ class ModalAutor:
         janela.deiconify()
 
 #====================================================
-# APLICAÇÃO PRINCIPAL: DOWN 6.3.4 (Executável: Down6.exe)
+# APLICAÇÃO PRINCIPAL: DOWN 6.3.5 (Executável: Down6.exe)
 #====================================================
-VERSAO_ATUAL = "6.3.4"
+VERSAO_ATUAL = "6.3.5"
 
 class DownloaderApp:
     def __init__(self, root):
@@ -1440,13 +1530,13 @@ class DownloaderApp:
             self.tk_logo_topo = ImageTk.PhotoImage(img_topo)
             lbl_logo_topo = tk.Label(header, image=self.tk_logo_topo, bg=COR_FUNDO, cursor="hand2")
             lbl_logo_topo.pack(side=tk.LEFT)
-            lbl_logo_topo.bind("<Button-1>", lambda e: ModalMarca.abrir(self.root))
-            lbl_logo_topo.bind("<Button-3>", lambda e: ModalAutor.abrir(self.root))
+            lbl_logo_topo.bind("<Button-1>", lambda e: ModalAutor.abrir(self.root))
+            lbl_logo_topo.bind("<Button-3>", lambda e: ModalMarca.abrir(self.root))
         else:
             lbl_logo_topo = tk.Label(header, text="◆", font=("Segoe UI", 30), bg=COR_FUNDO, fg=COR_AMARELO, cursor="hand2")
             lbl_logo_topo.pack(side=tk.LEFT)
-            lbl_logo_topo.bind("<Button-1>", lambda e: ModalMarca.abrir(self.root))
-            lbl_logo_topo.bind("<Button-3>", lambda e: ModalAutor.abrir(self.root))
+            lbl_logo_topo.bind("<Button-1>", lambda e: ModalAutor.abrir(self.root))
+            lbl_logo_topo.bind("<Button-3>", lambda e: ModalMarca.abrir(self.root))
             
         frame_textos = tk.Frame(header, bg=COR_FUNDO)
         frame_textos.pack(side=tk.LEFT, padx=(10, 0))
@@ -2170,8 +2260,6 @@ class DownloaderApp:
                                 time.sleep(0.5)
                     except: pass
             else:
-                # Se for manifesto HLS (.m3u8) com stream unificado, evita a dupla falha desnecessária de bestvideo/bestaudio separados
-                # se o seletor inteligente baixar direto o vídeo já mesclado
                 if eh_hls:
                     if cb_progresso: cb_progresso(0, "Baixando Mídia HLS...")
                     cmd_hls_direto = [cmd_ytdlp, "--newline", "--no-playlist", "--concurrent-fragments", frag_count, "-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4", "-o", arquivo_final] + base_args + [url]
@@ -2209,10 +2297,6 @@ class DownloaderApp:
                         cmd_b = [cmd_ytdlp, "--newline", "--no-playlist", "--concurrent-fragments", frag_count, "-f", "best", "-o", arquivo_final] + base_args + [url]
                         rodar_cmd(cmd_b, 98, 0)
 
-            #====================================================
-            # FASE 3 E 4 (NOVAS CAMADAS v6.3.4): PROTOCOLO CAMALEÃO ANTI-403 & RESGATE FFMPEG
-            # Acionadas SOMENTE se o arquivo ainda não existir (Ex: Falha HTTP 403 do Item 04)
-            #====================================================
             arquivo_existe_valido = os.path.exists(arquivo_final) and os.path.getsize(arquivo_final) > 0
             if not arquivo_existe_valido and not self.cancelado:
                 if cb_log: cb_log("-> [AUTO-CURA v6.3.4] Acionando Protocolo Camaleão Anti-403 (Higienização de URL, Referers de Player e Sessão)...")
@@ -2256,7 +2340,6 @@ class DownloaderApp:
                                     if cb_log: cb_log(f"-> [AUTO-CURA v6.3.4] Sucesso no resgate via Camaleão (Referer={ref_cand}, Nav={nav_cand or 'Padrão'})!")
                                     break
 
-                        # FASE 4: Se o yt-dlp continuar bloqueado na página com 403, tenta extração de stream direta pelo FFmpeg
                         if not resgatado and not self.cancelado and (".m3u8" in u_cand.lower() or "/hls/" in u_cand.lower()):
                             if cb_log: cb_log(f"-> [AUTO-CURA v6.3.4] Tentando captura direta de pacotes via FFmpeg ({ref_cand})...")
                             if executar_resgate_ffmpeg_direto(
