@@ -1,0 +1,2773 @@
+import os
+import re
+import sys
+import math
+import shutil
+import zipfile
+import subprocess
+import threading
+import time
+import urllib.request
+import urllib.parse
+import webbrowser
+import tkinter as tk
+from tkinter import filedialog, ttk
+from PIL import Image, ImageTk
+
+# Tenta importar winsound para os efeitos sonoros (nativo do Windows)
+try:
+    import winsound
+except ImportError:
+    winsound = None
+
+#====================================================
+# RESOLUÇÃO DO DIRETÓRIO BASE E LOCALIZAÇÃO DE RECURSOS
+#====================================================
+if getattr(sys, 'frozen', False):
+    PASTA_APP = os.path.dirname(os.path.abspath(sys.executable))
+    PASTA_BUNDLE = getattr(sys, '_MEIPASS', PASTA_APP)
+else:
+    PASTA_APP = os.path.dirname(os.path.abspath(sys.argv[0]))
+    PASTA_BUNDLE = PASTA_APP
+
+def obter_caminho_icone() -> str:
+    locais = [
+        os.path.join(PASTA_APP, "logo.ico"),
+        os.path.join(PASTA_BUNDLE, "logo.ico"),
+        os.path.join(os.getcwd(), "logo.ico")
+    ]
+    for caminho in locais:
+        if os.path.exists(caminho): return caminho
+    return ""
+
+def obter_caminho_logo_png() -> str:
+    locais = [
+        os.path.join(PASTA_APP, "logo.png"),
+        os.path.join(PASTA_BUNDLE, "logo.png"),
+        os.path.join(os.getcwd(), "logo.png")
+    ]
+    for caminho in locais:
+        if os.path.exists(caminho): return caminho
+    return ""
+
+def obter_pasta_downloads_windows() -> str:
+    user_profile = os.environ.get('USERPROFILE')
+    if user_profile:
+        pasta_dl = os.path.join(user_profile, "Downloads")
+        if os.path.exists(pasta_dl): return pasta_dl
+    return os.path.join(os.path.expanduser("~"), "Downloads")
+
+def centralizar_janela(janela, largura, altura):
+    janela.geometry(f"{largura}x{altura}")
+    janela.update_idletasks()
+    sw = janela.winfo_screenwidth()
+    sh = janela.winfo_screenheight()
+    x = (sw - largura) // 2
+    y = (sh - altura) // 2
+    janela.geometry(f"+{x}+{y}")
+
+def obter_comando(nome_bin: str) -> str:
+    ext = ".exe" if os.name == "nt" and not nome_bin.lower().endswith(".exe") else ""
+    nome_arq = f"{nome_bin}{ext}"
+    locais = [
+        os.path.join(PASTA_APP, nome_arq),
+        os.path.join(PASTA_BUNDLE, nome_arq),
+        os.path.join(os.getcwd(), nome_arq)
+    ]
+    for caminho in locais:
+        if os.path.exists(caminho):
+            return caminho
+    caminho_sys = shutil.which(nome_bin) or shutil.which(nome_arq)
+    return caminho_sys if caminho_sys else nome_arq
+
+def checar_executavel(nome_bin: str) -> bool:
+    ext = ".exe" if os.name == "nt" and not nome_bin.lower().endswith(".exe") else ""
+    nome_arq = f"{nome_bin}{ext}"
+    locais = [
+        os.path.join(PASTA_APP, nome_arq),
+        os.path.join(PASTA_BUNDLE, nome_arq),
+        os.path.join(os.getcwd(), nome_arq)
+    ]
+    for caminho in locais:
+        if os.path.exists(caminho):
+            return True
+    return bool(shutil.which(nome_bin) or shutil.which(nome_arq))
+
+def abrir_pasta_no_explorer(caminho_pasta: str):
+    try:
+        caminho_norm = os.path.normpath(caminho_pasta)
+        if os.path.exists(caminho_norm):
+            if os.name == 'nt':
+                os.startfile(caminho_norm)
+            else:
+                subprocess.Popen(['xdg-open', caminho_norm])
+    except Exception:
+        pass
+
+#====================================================
+# MOTOR CENTRAL DE EXECUÇÃO DE PROCESSOS (ALVO 3)
+#====================================================
+def executar_processo(
+    cmd: list, 
+    flags_criacao: int, 
+    capturar_saida: bool = True, 
+    on_linha=None, 
+    is_cancelado_fn=None, 
+    on_start=None, 
+    timeout: int = None, 
+    on_tick=None
+) -> tuple:
+    """
+    Motor central unificado para execução segura de processos externos.
+    Retorna (finalizado_com_sucesso sem timeout/cancel, returncode).
+    """
+    try:
+        out_dest = subprocess.PIPE if capturar_saida else subprocess.DEVNULL
+        err_dest = subprocess.STDOUT if capturar_saida else subprocess.DEVNULL
+        
+        proc = subprocess.Popen(
+            cmd,
+            stdout=out_dest,
+            stderr=err_dest,
+            stdin=subprocess.DEVNULL,
+            text=True if capturar_saida else False,
+            encoding='utf-8' if capturar_saida else None,
+            errors='ignore' if capturar_saida else None,
+            bufsize=1 if capturar_saida else -1,
+            creationflags=flags_criacao
+        )
+    except Exception:
+        return False, -1
+
+    if on_start:
+        on_start(proc)
+
+    lendo = [True]
+    t_leitura = None
+
+    if capturar_saida:
+        def ler_stdout():
+            try:
+                for linha in iter(proc.stdout.readline, ''):
+                    if not lendo[0] or (is_cancelado_fn and is_cancelado_fn()):
+                        break
+                    if linha and on_linha:
+                        on_linha(linha)
+            except Exception:
+                pass
+            finally:
+                try: proc.stdout.close()
+                except: pass
+
+        t_leitura = threading.Thread(target=ler_stdout, daemon=True)
+        t_leitura.start()
+
+    expirado = False
+    
+    if timeout is not None and timeout > 0:
+        for seg in range(timeout, 0, -1):
+            if is_cancelado_fn and is_cancelado_fn():
+                break
+            if proc.poll() is not None:
+                break
+            if on_tick:
+                on_tick(seg)
+            
+            # Loop curtos para responsividade a cancelamento rápido
+            for _ in range(10):
+                if (is_cancelado_fn and is_cancelado_fn()) or proc.poll() is not None:
+                    break
+                time.sleep(0.1)
+        else:
+            if proc.poll() is None:
+                expirado = True
+    else:
+        while proc.poll() is None:
+            if is_cancelado_fn and is_cancelado_fn():
+                break
+            time.sleep(0.1)
+
+    lendo[0] = False
+    cancelado = is_cancelado_fn() if is_cancelado_fn else False
+
+    if cancelado or expirado:
+        try: proc.kill()
+        except Exception: pass
+        if t_leitura: t_leitura.join(timeout=0.5)
+        return False, proc.returncode if proc.returncode is not None else -1
+
+    proc.wait()
+    if t_leitura: t_leitura.join(timeout=0.5)
+    return True, proc.returncode
+
+def instalar_motores_sistema(tem_ytdlp: bool, tem_ffmpeg: bool, tem_deno: bool, forcar_limpeza: bool=False, cb_log=None):
+    try:
+        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        motores = ["yt-dlp.exe", "ffmpeg.exe", "deno.exe"]
+
+        if forcar_limpeza:
+            if cb_log: cb_log("Limpando arquivos antigos...\n")
+            for motor in motores:
+                caminho = os.path.join(PASTA_APP, motor)
+                if os.path.exists(caminho):
+                    try:
+                        os.remove(caminho)
+                        if cb_log: cb_log(f" - {motor} removido.\n")
+                    except Exception as e:
+                        if cb_log: cb_log(f" - Falha ao remover {motor}: {e}\n")
+            if cb_log: cb_log("\nIniciando download das versões mais recentes...\n")
+            tem_ytdlp = tem_ffmpeg = tem_deno = False
+
+        if not tem_ytdlp:
+            if cb_log: cb_log("[1/3] Baixando yt-dlp.exe...\n")
+            url_ytdlp = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+            with urllib.request.urlopen(urllib.request.Request(url_ytdlp, headers={"User-Agent": user_agent}), timeout=30) as resp, open(os.path.join(PASTA_APP, "yt-dlp.exe"), 'wb') as out_f:
+                shutil.copyfileobj(resp, out_f)
+            if cb_log: cb_log("yt-dlp baixado!\n")
+
+        if not tem_ffmpeg:
+            if cb_log: cb_log("[2/3] Baixando e extraindo ffmpeg...\n")
+            url_ffmpeg = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+            zip_tmp = os.path.join(PASTA_APP, "ffmpeg_tmp.zip")
+            with urllib.request.urlopen(urllib.request.Request(url_ffmpeg, headers={"User-Agent": user_agent}), timeout=60) as resp, open(zip_tmp, 'wb') as out_f:
+                shutil.copyfileobj(resp, out_f)
+            with zipfile.ZipFile(zip_tmp, 'r') as z:
+                for arq in z.namelist():
+                    if arq.endswith("ffmpeg.exe"):
+                        with z.open(arq) as zf, open(os.path.join(PASTA_APP, "ffmpeg.exe"), 'wb') as df: shutil.copyfileobj(zf, df)
+                        break
+            if os.path.exists(zip_tmp): os.remove(zip_tmp)
+            if cb_log: cb_log("ffmpeg baixado!\n")
+
+        if not tem_deno:
+            if cb_log: cb_log("[3/3] Baixando e extraindo deno.exe...\n")
+            url_deno = "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip"
+            zip_deno = os.path.join(PASTA_APP, "deno_tmp.zip")
+            with urllib.request.urlopen(urllib.request.Request(url_deno, headers={"User-Agent": user_agent}), timeout=60) as resp, open(zip_deno, 'wb') as out_f:
+                shutil.copyfileobj(resp, out_f)
+            with zipfile.ZipFile(zip_deno, 'r') as z:
+                z.extract("deno.exe", PASTA_APP)
+            if os.path.exists(zip_deno): os.remove(zip_deno)
+            if cb_log: cb_log("deno baixado!\n")
+
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+#====================================================
+# NOVAS FUNÇÕES DE INTELIGÊNCIA E AUTO-CURA DE ERROS (v6.3.4)
+#====================================================
+USER_AGENT_PADRAO = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+
+def obter_seletor_formato_video(url: str) -> str:
+    u_low = url.lower()
+    if ".m3u8" in u_low or "/hls/" in u_low:
+        return "bestvideo/best"
+    return "bestvideo"
+
+def obter_seletor_formato_audio(url: str) -> str:
+    u_low = url.lower()
+    if ".m3u8" in u_low or "/hls/" in u_low:
+        return "bestaudio/best"
+    return "bestaudio"
+
+def gerar_candidatos_url_hls(url: str) -> list:
+    candidatos = [url]
+    
+    url_sem_dub = re.sub(r'([?&])youtubedubbing=true(&?)', lambda m: m.group(1) if m.group(2) else '', url)
+    url_sem_dub = url_sem_dub.rstrip('?&')
+    if url_sem_dub and url_sem_dub not in candidatos:
+        candidatos.append(url_sem_dub)
+
+    for u_base in list(candidatos):
+        if "/hls/" in u_base and ("audio=" in u_base or "video=" in u_base):
+            partes = u_base.split("?", 1)
+            caminho_url = partes[0]
+            query_str = "?" + partes[1] if len(partes) > 1 else ""
+            pasta_hls = caminho_url.rsplit("/", 1)[0]
+            nome_sub = caminho_url.rsplit("/", 1)[1]
+            
+            m_ts = re.search(r'-(\d{10,15})-', nome_sub)
+            if m_ts:
+                ts = m_ts.group(1)
+                cand_pkg = f"{pasta_hls}/master-pkg-t-{ts}.m3u8{query_str}"
+                if cand_pkg not in candidatos:
+                    candidatos.append(cand_pkg)
+            
+            for nome_mestre in ["master.m3u8", "index.m3u8", "playlist.m3u8"]:
+                cand_m = f"{pasta_hls}/{nome_mestre}{query_str}"
+                if cand_m not in candidatos:
+                    candidatos.append(cand_m)
+
+    return candidatos
+
+def executar_resgate_ffmpeg_direto(cmd_ffmpeg: str, url_alvo: str, arquivo_final: str, formato_selecionado: str, referer_url: str, id_sessao: str, processos_ativos: dict, is_cancelado_fn, flags_criacao: int) -> bool:
+    try:
+        parsed = urllib.parse.urlparse(referer_url)
+        origin_url = f"{parsed.scheme}://{parsed.netloc}"
+        headers_str = (
+            f"User-Agent: {USER_AGENT_PADRAO}\r\n"
+            f"Referer: {referer_url}\r\n"
+            f"Origin: {origin_url}\r\n"
+        )
+        if formato_selecionado == "audio":
+            cmd_ff = [
+                cmd_ffmpeg, "-y",
+                "-headers", headers_str,
+                "-i", url_alvo,
+                "-vn", "-q:a", "0",
+                arquivo_final
+            ]
+        else:
+            cmd_ff = [
+                cmd_ffmpeg, "-y",
+                "-headers", headers_str,
+                "-i", url_alvo,
+                "-c", "copy",
+                "-bsf:a", "aac_adtstoasc",
+                arquivo_final
+            ]
+            
+        def cb_start(proc):
+            if id_sessao in processos_ativos:
+                processos_ativos[id_sessao].append(proc)
+                
+        ok, rc = executar_processo(
+            cmd=cmd_ff,
+            flags_criacao=flags_criacao,
+            capturar_saida=False,
+            is_cancelado_fn=is_cancelado_fn,
+            on_start=cb_start
+        )
+        return ok and rc == 0 and os.path.exists(arquivo_final) and os.path.getsize(arquivo_final) > 0
+    except Exception:
+        return False
+
+#====================================================
+# PALETA DE CORES DEFINITIVA
+#====================================================
+COR_FUNDO = "#0B132B"
+COR_CONTAINER = "#1C2541"
+COR_CARD_HOVER = "#243257"
+COR_AMARELO = "#FFD700"
+COR_AMARELO_HOVER = "#FFC300"
+COR_BRANCO = "#FFFFFF"
+COR_PRETO = "#030508"
+COR_CINZA_TEXTO = "#94A3B8"
+COR_PLACEHOLDER = "#64748B"
+COR_VERDE_OK = "#10B981"
+COR_VERMELHO = "#EF4444"
+COR_VERDE_MATRIX = "#00FF41" 
+PLACEHOLDER_NOME = "Deixe em branco para usar o nome original"
+
+#====================================================
+# GERENCIADOR DE ÁUDIO NOSTALGIA (MANTIDO INTACTO)
+#====================================================
+class AudioNostalgia:
+    @staticmethod
+    def tocar_modem():
+        if not winsound: return
+        def _play():
+            try:
+                for freq, dur in [(1200, 100), (2100, 100), (1200, 100), (800, 200), (1500, 300)]:
+                    winsound.Beep(freq, dur)
+                for _ in range(15):
+                    winsound.Beep(2000, 15)
+                    winsound.Beep(800, 15)
+            except: pass
+        threading.Thread(target=_play, daemon=True).start()
+
+    @staticmethod
+    def tocar_tecla():
+        if not winsound: return
+        try: winsound.Beep(1800, 8) 
+        except: pass
+
+    @staticmethod
+    def tocar_ocupado():
+        if not winsound: return
+        def _play():
+            try:
+                for _ in range(4):
+                    winsound.Beep(500, 500)
+                    time.sleep(0.2)
+            except: pass
+        threading.Thread(target=_play, daemon=True).start()
+
+#====================================================
+# CLASSE DE NOTIFICAÇÃO TOAST FLUTUANTE (MANTIDA INTACTA)
+#====================================================
+class ToastNotification:
+    @staticmethod
+    def show(parent, titulo: str, mensagem: str):
+        toast = tk.Toplevel(parent)
+        toast.overrideredirect(True)
+        toast.configure(bg=COR_CONTAINER)
+        toast.attributes("-topmost", True)
+        
+        largura, altura = 360, 75
+        parent.update_idletasks()
+        px = parent.winfo_x() + parent.winfo_width() - largura - 25
+        py = parent.winfo_y() + parent.winfo_height() - altura - 25
+        toast.geometry(f"{largura}x{altura}+{px}+{py}")
+        
+        borda = tk.Frame(toast, bg=COR_AMARELO, width=5)
+        borda.pack(side=tk.LEFT, fill=tk.Y)
+        
+        corpo = tk.Frame(toast, bg=COR_CONTAINER, padx=12, pady=8)
+        corpo.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        tk.Label(corpo, text=titulo, font=("Segoe UI", 10, "bold"), bg=COR_CONTAINER, fg=COR_AMARELO).pack(anchor="w")
+        tk.Label(corpo, text=mensagem, font=("Segoe UI", 8), bg=COR_CONTAINER, fg=COR_BRANCO, wraplength=320, justify="left").pack(anchor="w", pady=(2, 0))
+        
+        toast.after(2000, toast.destroy)
+
+#====================================================
+# CAIXAS DE MENSAGEM NATIVAS (MANTIDAS INTACTAS)
+#====================================================
+class ModalMensagem:
+    @staticmethod
+    def show(parent, titulo: str, mensagem: str, tipo: str = "info"):
+        win = tk.Toplevel(parent)
+        win.withdraw()
+        win.title(titulo)
+        centralizar_janela(win, 520, 260)
+        win.configure(bg=COR_FUNDO)
+        win.transient(parent)
+        win.attributes("-topmost", True)
+        win.grab_set()
+        
+        ico = obter_caminho_icone()
+        if ico:
+            try: win.iconbitmap(ico)
+            except Exception: pass
+        
+        corpo = tk.Frame(win, bg=COR_CONTAINER, bd=1, relief=tk.SOLID, padx=20, pady=20)
+        corpo.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+        
+        cor_titulo = COR_VERMELHO if tipo == "erro" else (COR_AMARELO if tipo == "aviso" else COR_VERDE_OK)
+        tk.Label(corpo, text=titulo.upper(), font=("Segoe UI", 12, "bold"), bg=COR_CONTAINER, fg=cor_titulo).pack(pady=(0, 10))
+        tk.Label(corpo, text=mensagem, font=("Segoe UI", 10), bg=COR_CONTAINER, fg=COR_BRANCO, wraplength=440, justify="center").pack(expand=True, pady=(0, 15))
+        tk.Button(corpo, text="OK", command=win.destroy, font=("Segoe UI", 9, "bold"), bg=COR_AMARELO, fg=COR_PRETO, relief=tk.FLAT, cursor="hand2", padx=30, pady=5).pack()
+        win.deiconify()
+        win.wait_window()
+
+    @staticmethod
+    def ask_yes_no(parent, titulo: str, mensagem: str) -> bool:
+        win = tk.Toplevel(parent)
+        win.withdraw()
+        win.title(titulo)
+        centralizar_janela(win, 520, 260)
+        win.configure(bg=COR_FUNDO)
+        win.transient(parent)
+        win.attributes("-topmost", True)
+        win.grab_set()
+        
+        ico = obter_caminho_icone()
+        if ico:
+            try: win.iconbitmap(ico)
+            except Exception: pass
+        
+        corpo = tk.Frame(win, bg=COR_CONTAINER, bd=1, relief=tk.SOLID, padx=20, pady=20)
+        corpo.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+        
+        tk.Label(corpo, text=titulo.upper(), font=("Segoe UI", 12, "bold"), bg=COR_CONTAINER, fg=COR_AMARELO).pack(pady=(0, 10))
+        tk.Label(corpo, text=mensagem, font=("Segoe UI", 10), bg=COR_CONTAINER, fg=COR_BRANCO, wraplength=440, justify="center").pack(expand=True, pady=(0, 15))
+        
+        frame_btn = tk.Frame(corpo, bg=COR_CONTAINER)
+        frame_btn.pack()
+        
+        resultado = tk.BooleanVar(value=False)
+        def set_yes(): resultado.set(True); win.destroy()
+        def set_no(): resultado.set(False); win.destroy()
+            
+        tk.Button(frame_btn, text="SIM", command=set_yes, font=("Segoe UI", 9, "bold"), bg=COR_AMARELO, fg=COR_PRETO, relief=tk.FLAT, cursor="hand2", padx=25, pady=5).pack(side=tk.LEFT, padx=10)
+        tk.Button(frame_btn, text="NÃO", command=set_no, font=("Segoe UI", 9, "bold"), bg=COR_PRETO, fg=COR_BRANCO, relief=tk.FLAT, cursor="hand2", padx=25, pady=5).pack(side=tk.LEFT, padx=10)
+        
+        win.deiconify()
+        win.wait_window()
+        return resultado.get()
+
+#====================================================
+# MODAL: RELATÓRIO COMPLETO DE SESSÃO, LOG & WHATSAPP (MANTIDO INTACTO)
+#====================================================
+class ModalRelatorioSessao:
+    @staticmethod
+    def abrir(parent, modo_titulo: str, total: int, sucessos_limpos: int, sucessos_com_erro: int, falhas_totais: int, conteudo_log: str, pastas_destino: list):
+        win = tk.Toplevel(parent)
+        win.withdraw()
+        win.title(f"Relatório Detalhado da Sessão - {modo_titulo}")
+        win.minsize(720, 620)
+        centralizar_janela(win, 760, 660)
+        win.configure(bg=COR_FUNDO)
+        win.transient(parent)
+        win.attributes("-topmost", True)
+        win.grab_set()
+
+        ico = obter_caminho_icone()
+        if ico:
+            try: win.iconbitmap(ico)
+            except Exception: pass
+
+        corpo = tk.Frame(win, bg=COR_CONTAINER, bd=1, relief=tk.SOLID, padx=22, pady=20)
+        corpo.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+
+        houve_qualquer_erro = (sucessos_com_erro > 0) or (falhas_totais > 0)
+        total_baixados = sucessos_limpos + sucessos_com_erro
+
+        if falhas_totais == 0 and sucessos_com_erro == 0:
+            cor_header = COR_VERDE_OK
+            titulo_header = "PROCESSO CONCLUÍDO COM 100% DE SUCESSO!"
+        elif falhas_totais == 0 and sucessos_com_erro > 0:
+            cor_header = COR_AMARELO
+            titulo_header = "DOWNLOADS CONCLUÍDOS COM SUCESSO (COM OCORRÊNCIAS TÉCNICAS)"
+        elif total_baixados > 0 and falhas_totais > 0:
+            cor_header = COR_AMARELO
+            titulo_header = "PROCESSO FINALIZADO COM SUCESSOS PARCIAIS E FALHAS"
+        else:
+            cor_header = COR_VERMELHO
+            titulo_header = "FALHA NO PROCESSAMENTO DOS ARQUIVOS"
+
+        tk.Label(corpo, text=titulo_header, font=("Segoe UI", 13, "bold"), bg=COR_CONTAINER, fg=cor_header).pack(anchor="w", pady=(0, 8))
+
+        frame_relatorio = tk.Frame(corpo, bg=COR_PRETO, bd=1, relief=tk.SOLID, padx=12, pady=12)
+        frame_relatorio.pack(fill=tk.BOTH, expand=True, pady=(0, 12))
+
+        txt_rel = tk.Text(frame_relatorio, bg=COR_PRETO, fg=COR_BRANCO, font=("Segoe UI", 9), relief=tk.FLAT, wrap=tk.WORD)
+        txt_rel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb = tk.Scrollbar(frame_relatorio, command=txt_rel.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        txt_rel.config(yscrollcommand=sb.set)
+
+        txt_rel.tag_configure("destaque_amarelo", font=("Segoe UI", 10, "bold"), foreground=COR_AMARELO)
+        txt_rel.tag_configure("destaque_verde", font=("Segoe UI", 10, "bold"), foreground=COR_VERDE_OK)
+        txt_rel.tag_configure("destaque_vermelho", font=("Segoe UI", 10, "bold"), foreground=COR_VERMELHO)
+        txt_rel.tag_configure("normal", font=("Segoe UI", 9), foreground=COR_BRANCO)
+
+        txt_rel.insert(tk.END, "RESUMO DO QUE ACONTECEU EXPLICADO EM DETALHES:\n\n", "destaque_amarelo")
+        txt_rel.insert(tk.END, f"• Total de arquivos processados nesta sessão: {total}\n", "normal")
+        txt_rel.insert(tk.END, f"• Downloads concluídos perfeitamente (sem avisos): {sucessos_limpos}\n", "destaque_verde" if sucessos_limpos > 0 else "normal")
+        txt_rel.insert(tk.END, f"• Downloads concluídos COM SUCESSO, mas que registraram erros não-fatais no percurso: {sucessos_com_erro}\n", "destaque_amarelo" if sucessos_com_erro > 0 else "normal")
+        txt_rel.insert(tk.END, f"• Downloads que falharam e não puderam ser salvos: {falhas_totais}\n\n", "destaque_vermelho" if falhas_totais > 0 else "normal")
+
+        if sucessos_com_erro > 0:
+            txt_rel.insert(tk.END, "ENTENDA OS DOWNLOADS QUE TIVERAM ERROS MAS FUNCIONARAM:\n\n", "destaque_amarelo")
+            txt_rel.insert(tk.END, (
+                "Durante a comunicação com o servidor de vídeo, o motor de download encontrou uma recusa inicial de formato ou de conexão, "
+                "mas o aplicativo acionou imediatamente seus protocolos internos de contingência e BAIXOU O SEU ARQUIVO COMPLETO COM SUCESSO!\n"
+                "Por isso, na tela principal, esses itens estão piscando em Verde/Branco com o aviso de que houve erro no processo, mas o download foi concluído.\n\n"
+            ), "normal")
+
+        if falhas_totais > 0:
+            txt_rel.insert(tk.END, "ENTENDA AS FALHAS CATASTRÓFICAS:\n\n", "destaque_vermelho")
+            txt_rel.insert(tk.END, (
+                "Em um ou mais itens, o servidor recusou todas as tentativas de conexão, o link expirou ou possui bloqueio severo. "
+                "Esses itens ficaram marcados em vermelho na tela principal.\n\n"
+            ), "normal")
+
+        if houve_qualquer_erro:
+            txt_rel.insert(tk.END, "VOCÊ DESEJA AJUDAR A MELHORAR O APLICATIVO?\n\n", "destaque_amarelo")
+            txt_rel.insert(tk.END, (
+                "Qualquer erro ocorrido (mesmo aqueles que não impediram o download final) é fundamental para que o autor (Swammy Léo Sussuarana) "
+                "possa analisar o comportamento das plataformas e aperfeiçoar o aplicativo.\n\n"
+                "Para colaborar, siga os 2 passos nos botões abaixo:\n"
+                "1º) Clique em '1. GERAR E SALVAR ARQUIVO DE LOG' e escolha onde salvar o arquivo 'log-erro.txt' no seu computador.\n"
+                "2º) Clique em '2. ABRIR WHATSAPP WEB PARA ENVIAR O LOG'. Quando a conversa abrir no seu navegador, anexe o arquivo de LOG que você acabou de salvar e envie para o autor!"
+            ), "normal")
+        else:
+            txt_rel.insert(tk.END, "TUDO PRONTO!\n\n", "destaque_verde")
+            txt_rel.insert(tk.END, "Todos os seus arquivos foram transferidos e processados sem nenhuma intercorrência técnica.", "normal")
+
+        txt_rel.config(state=tk.DISABLED)
+
+        caminho_log_salvo = tk.StringVar(value="")
+
+        lbl_status_log = tk.Label(corpo, text="", font=("Segoe UI", 8, "bold"), bg=COR_CONTAINER, fg=COR_VERDE_OK)
+        lbl_status_log.pack(anchor="w", pady=(0, 6))
+
+        def acao_salvar_log():
+            caminho = filedialog.asksaveasfilename(
+                parent=win,
+                title="Escolha onde salvar o arquivo de LOG de Erros",
+                defaultextension=".txt",
+                initialfile="log-erro.txt",
+                filetypes=[("Arquivo de Texto (LOG)", "*.txt"), ("Todos os arquivos", "*.*")]
+            )
+            if caminho:
+                try:
+                    with open(caminho, "w", encoding="utf-8") as f:
+                        f.write(f"=== RELATÓRIO DE LOG - DOWN {VERSAO_ATUAL} ===\n")
+                        f.write(f"Modo: {modo_titulo} | Total: {total} | Sucessos Limpos: {sucessos_limpos} | Sucessos c/ Erro: {sucessos_com_erro} | Falhas: {falhas_totais}\n")
+                        f.write("=" * 60 + "\n\n")
+                        f.write(conteudo_log)
+                    caminho_log_salvo.set(caminho)
+                    lbl_status_log.config(text=f"✔ Arquivo de LOG salvo com sucesso em: {caminho}", fg=COR_VERDE_OK)
+                    ModalMensagem.show(
+                        win,
+                        "Arquivo de LOG Gerado!",
+                        f"O arquivo de LOG foi salvo com sucesso em:\n{caminho}\n\nAgora clique no botão verde do WhatsApp Web para enviar este arquivo ao autor!",
+                        "info"
+                    )
+                except Exception as e:
+                    ModalMensagem.show(win, "Erro ao Salvar", f"Não foi possível gravar o arquivo de LOG:\n{e}", "erro")
+
+        def acao_abrir_whatsapp():
+            if not caminho_log_salvo.get():
+                deseja_salvar = ModalMensagem.ask_yes_no(
+                    win,
+                    "Gerar Arquivo de LOG Primeiro?",
+                    "Você ainda não salvou o arquivo de LOG no seu computador.\n\nDeseja escolher onde salvar o arquivo 'log-erro.txt' agora antes de abrir o WhatsApp Web?"
+                )
+                if deseja_salvar:
+                    acao_salvar_log()
+
+            local_salvo = caminho_log_salvo.get() if caminho_log_salvo.get() else "(que salvei no meu computador)"
+            msg_whats = (
+                f"Olá Swammy Léo! Estou usando o aplicativo DOWN {VERSAO_ATUAL} ({modo_titulo}) e gostaria de ajudar a melhorar o sistema enviando o arquivo de LOG.\n"
+                f"Resumo da sessão: {total_baixados} baixado(s) com sucesso ({sucessos_com_erro} com aviso no processo) e {falhas_totais} falha(s).\n"
+                f"Estou anexando o arquivo de LOG nesta conversa!"
+            )
+            url_wa = "https://wa.me/5561981951122?text=" + urllib.parse.quote(msg_whats)
+            webbrowser.open(url_wa)
+
+            ModalMensagem.show(
+                win,
+                "Instrução para Anexar o LOG no WhatsApp",
+                f"O WhatsApp Web foi aberto no seu navegador!\n\n"
+                f"IMPORTANTE: Na janela de conversa do WhatsApp, clique no ícone de Clipe / Anexar (+), selecione Documento e anexe o arquivo de LOG:\n"
+                f"{local_salvo}\n\n"
+                f"Depois de enviar, volte aqui e clique em 'CONCLUIR E ABRIR PASTA DOS ARQUIVOS'.",
+                "aviso"
+            )
+
+        def acao_fechar_e_abrir_pasta():
+            win.destroy()
+            if total_baixados > 0 and pastas_destino:
+                pasta_unica = pastas_destino[0]
+                ModalMensagem.show(
+                    parent,
+                    "Verificação dos Arquivos Baixados",
+                    f"A pasta onde os arquivos foram gravados será aberta agora:\n\n{pasta_unica}\n\n"
+                    f"Por favor, faça um teste abrindo os arquivos para confirmar que cada download obteve pleno sucesso!",
+                    "info"
+                )
+                for p_dir in pastas_destino:
+                    abrir_pasta_no_explorer(p_dir)
+
+        if houve_qualquer_erro:
+            frame_botoes_erro = tk.Frame(corpo, bg=COR_CONTAINER)
+            frame_botoes_erro.pack(fill=tk.X, pady=(0, 10))
+            
+            btn_salvar_log = tk.Button(
+                frame_botoes_erro,
+                text="1. GERAR E SALVAR ARQUIVO DE LOG",
+                command=acao_salvar_log,
+                font=("Segoe UI", 9, "bold"),
+                bg=COR_AMARELO,
+                fg=COR_PRETO,
+                activebackground=COR_AMARELO_HOVER,
+                relief=tk.FLAT,
+                cursor="hand2",
+                pady=8,
+                padx=12
+            )
+            btn_salvar_log.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+
+            btn_whats = tk.Button(
+                frame_botoes_erro,
+                text="2. ABRIR WHATSAPP WEB PARA ENVIAR O LOG",
+                command=acao_abrir_whatsapp,
+                font=("Segoe UI", 9, "bold"),
+                bg="#059669",
+                fg=COR_BRANCO,
+                activebackground="#047857",
+                relief=tk.FLAT,
+                cursor="hand2",
+                pady=8,
+                padx=12
+            )
+            btn_whats.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(6, 0))
+
+        texto_btn_final = "CONCLUIR E ABRIR PASTA DOS ARQUIVOS" if total_baixados > 0 else "FECHAR RELATÓRIO"
+        tk.Button(
+            corpo,
+            text=texto_btn_final,
+            command=acao_fechar_e_abrir_pasta,
+            font=("Segoe UI", 10, "bold"),
+            bg=COR_VERDE_OK if total_baixados > 0 else COR_VERMELHO,
+            fg=COR_PRETO if total_baixados > 0 else COR_BRANCO,
+            relief=tk.FLAT,
+            cursor="hand2",
+            pady=8
+        ).pack(fill=tk.X)
+
+        win.protocol("WM_DELETE_WINDOW", acao_fechar_e_abrir_pasta)
+        win.deiconify()
+        win.wait_window()
+
+#====================================================
+# MODAL: COMO USAR (MANTIDO INTACTO)
+#====================================================
+class ModalComoUsar:
+    @staticmethod
+    def abrir(parent):
+        janela = tk.Toplevel(parent)
+        janela.withdraw()
+        janela.title("Guia do Usuário - Como Capturar Links & Baixar")
+        janela.minsize(700, 580)
+        centralizar_janela(janela, 780, 700)
+        janela.configure(bg=COR_FUNDO)
+        janela.transient(parent)
+        janela.grab_set()
+        
+        ico = obter_caminho_icone()
+        if ico:
+            try: janela.iconbitmap(ico)
+            except Exception: pass
+        
+        corpo = tk.Frame(janela, bg=COR_CONTAINER, bd=1, relief=tk.SOLID, padx=20, pady=20)
+        corpo.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+        
+        topo_frame = tk.Frame(corpo, bg=COR_CONTAINER)
+        topo_frame.pack(fill=tk.X, pady=(0, 10))
+
+        frame_titulo = tk.Frame(topo_frame, bg=COR_CONTAINER)
+        frame_titulo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(frame_titulo, text="GUIA RÁPIDO DE OPERAÇÃO", font=("Segoe UI", 15, "bold"), bg=COR_CONTAINER, fg=COR_AMARELO).pack(anchor="w")
+        tk.Label(frame_titulo, text=f"Aprenda a operar as três arquiteturas do DOWN {VERSAO_ATUAL}.", font=("Segoe UI", 9), bg=COR_CONTAINER, fg=COR_CINZA_TEXTO).pack(anchor="w", pady=(2, 0))
+
+        caminho_logo = obter_caminho_logo_png()
+        if caminho_logo:
+            try:
+                img_pil = Image.open(caminho_logo).convert("RGBA")
+                img_pil = img_pil.resize((50, 50), Image.Resampling.LANCZOS)
+                tk_img_logo = ImageTk.PhotoImage(img_pil)
+                lbl_logo = tk.Label(topo_frame, image=tk_img_logo, bg=COR_CONTAINER)
+                lbl_logo.image = tk_img_logo
+                lbl_logo.pack(side=tk.RIGHT, padx=(10, 0))
+                
+                lbl_versao = tk.Label(topo_frame, text=f"v{VERSAO_ATUAL}", font=("Segoe UI", 8, "bold"), bg=COR_CONTAINER, fg=COR_BRANCO)
+                lbl_versao.pack(side=tk.RIGHT, anchor="s", pady=(0, 5))
+            except Exception:
+                pass
+        
+        frame_txt = tk.Frame(corpo, bg=COR_PRETO, bd=1, relief=tk.SOLID)
+        frame_txt.pack(fill=tk.BOTH, expand=True, pady=(5, 12))
+        
+        txt = tk.Text(frame_txt, bg=COR_PRETO, fg=COR_BRANCO, font=("Segoe UI", 9), relief=tk.FLAT, wrap=tk.WORD, padx=10, pady=10)
+        txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        sb = tk.Scrollbar(frame_txt, command=txt.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        txt.config(yscrollcommand=sb.set)
+        
+        txt.tag_configure("titulo", font=("Segoe UI", 10, "bold"), foreground=COR_AMARELO, spacing3=5)
+        txt.tag_configure("aviso_titulo", font=("Segoe UI", 11, "bold"), foreground=COR_BRANCO, spacing3=5)
+        txt.tag_configure("aviso_texto", font=("Segoe UI", 10, "bold"), foreground=COR_BRANCO, spacing3=10)
+        
+        tutorial = (
+            ("AVISO IMPORTANTE\n", "aviso_titulo"),
+            ("O DOWN não é uma ferramenta de pirataria. Nosso propósito é a garantia do seu direito ao acesso e à preservação do conteúdo que você adquiriu legitimamente. Acreditamos que, ao comprar um curso ou material, você deve ter a liberdade de consultá-lo pelo tempo que achar necessário, sem limitações ou expirações impostas pelas plataformas. Este aplicativo foi desenvolvido para que você possa guardar e assistir às suas aulas quando e onde quiser, garantindo que o seu investimento continue disponível para você, sem restrições.\n\n", None),
+            ("NÃO CONCORDAMOS E NÃO INCENTIVAMOS A PIRATARIA.\n\n", "aviso_texto"),
+            ("--------------------------------------------------\n\n", None),
+            ("ARQUITETURA 1: ARQUIVO ÚNICO (O Método Infalível)\n", "titulo"),
+            ("Esta é a forma mais garantida de baixar vídeos de plataformas de cursos (como Hotmart, Kiwify, etc.) que possuem proteção DRM ou bloqueiam o acesso automático.\n"
+             "1. Na página da aula, pressione a tecla F12 (ou botão direito > Inspecionar).\n"
+             "2. Clique na aba 'Rede' (Network). No campo de filtro digite: m3u8 (se não aparecer, tente mp4).\n"
+             "3. Dê PLAY no vídeo da aula.\n"
+             "4. Vai aparecer uma linha com o nome do arquivo (ex: master.m3u8). Clique com o botão direito nela > Copy > Copy link address.\n"
+             "5. Cole no DOWN e inicie o download.\n\n", None),
+            ("ARQUITETURA 2: DOWN POR LOTE (Para Avançados)\n", "titulo"),
+            ("Permite usar o Método Infalível (passo a passo acima) para enfileirar até 10 links m3u8 diferentes de uma só vez.\n"
+             "1. Cole os links nos campos correspondentes e marque as caixas.\n"
+             "2. O DOWN baixará os fragmentos simultaneamente para burlar a expiração do link.\n"
+             "Atenção: Evite abrir 10 conexões em plataformas que limitam acesso simultâneo para evitar bloqueios.\n\n", None)
+            #####################################################################################################################################
+            ###### NÃO MEXA DE FORMA ALGUMA NESSE TRECHO COMENTADO ##############################################################################
+            #####################################################################################################################################
+            #("ARQUITETURA 3: SHERLOCK-DOWN (O Rastreador Automático)\n", "titulo"),
+            #("Criado para máxima facilidade. O Sherlock tentará extrair o vídeo diretamente usando sua sessão atual do navegador (cookies).\n"
+            # "1. Acesse a sua plataforma e abra a página onde o vídeo está tocando.\n"
+            # "2. Copie o link normal do topo do navegador (a URL da página).\n"
+            # "3. Cole no DOWN, selecione o navegador que você usa e clique em INVESTIGAR.\n"
+            # "Se a plataforma usar criptografia forte (DRM), o Sherlock avisará e você deverá usar a Arquitetura 1.\n", None)
+            #####################################################################################################################################
+            #####################################################################################################################################
+            #####################################################################################################################################
+        )
+        
+        for texto, tag in tutorial:
+            if tag:
+                txt.insert(tk.END, texto, tag)
+            else:
+                txt.insert(tk.END, texto)
+                
+        txt.config(state=tk.DISABLED)
+        
+        tk.Button(corpo, text="ENTENDI, FECHAR GUIA", command=janela.destroy, font=("Segoe UI", 9, "bold"), bg=COR_AMARELO, fg=COR_PRETO, relief=tk.FLAT, cursor="hand2", pady=5, padx=20).pack(anchor="center")
+        janela.deiconify()
+
+#====================================================
+# MODAL: CONFIGURAR
+#====================================================
+class ModalConfigurar:
+    @staticmethod
+    def abrir(parent):
+        janela = tk.Toplevel(parent)
+        janela.withdraw()
+        janela.title("Configuração do Sistema - Motores de Download")
+        janela.minsize(620, 560)
+        centralizar_janela(janela, 680, 620)
+        janela.configure(bg=COR_FUNDO)
+        janela.transient(parent)
+        janela.grab_set()
+        
+        ico = obter_caminho_icone()
+        if ico:
+            try: janela.iconbitmap(ico)
+            except Exception: pass
+        
+        corpo = tk.Frame(janela, bg=COR_CONTAINER, bd=1, relief=tk.SOLID, padx=22, pady=20)
+        corpo.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+        
+        topo_frame = tk.Frame(corpo, bg=COR_CONTAINER)
+        topo_frame.pack(fill=tk.X, pady=(0, 10))
+
+        frame_titulo = tk.Frame(topo_frame, bg=COR_CONTAINER)
+        frame_titulo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(frame_titulo, text="DIAGNÓSTICO DE DEPENDÊNCIAS", font=("Segoe UI", 15, "bold"), bg=COR_CONTAINER, fg=COR_AMARELO).pack(anchor="w")
+        tk.Label(frame_titulo, text="O DOWN requer os motores 'yt-dlp', 'ffmpeg' e 'deno' para operar.", font=("Segoe UI", 9), bg=COR_CONTAINER, fg=COR_CINZA_TEXTO, justify="left").pack(anchor="w", pady=(2, 0))
+
+        caminho_logo = obter_caminho_logo_png()
+        if caminho_logo:
+            try:
+                img_pil = Image.open(caminho_logo).convert("RGBA")
+                img_pil = img_pil.resize((50, 50), Image.Resampling.LANCZOS)
+                tk_img_logo = ImageTk.PhotoImage(img_pil)
+                lbl_logo = tk.Label(topo_frame, image=tk_img_logo, bg=COR_CONTAINER)
+                lbl_logo.image = tk_img_logo
+                lbl_logo.pack(side=tk.RIGHT, padx=(10, 0))
+                
+                lbl_versao = tk.Label(topo_frame, text=f"v{VERSAO_ATUAL}", font=("Segoe UI", 8, "bold"), bg=COR_CONTAINER, fg=COR_BRANCO)
+                lbl_versao.pack(side=tk.RIGHT, anchor="s", pady=(0, 5))
+            except Exception:
+                pass
+        
+        tem_ytdlp = checar_executavel("yt-dlp")
+        tem_ffmpeg = checar_executavel("ffmpeg")
+        tem_deno = checar_executavel("deno")
+        
+        card_status = tk.Frame(corpo, bg=COR_PRETO, bd=1, relief=tk.SOLID, padx=15, pady=12)
+        card_status.pack(fill=tk.X, pady=(0, 15))
+        
+        f_ytdlp = tk.Frame(card_status, bg=COR_PRETO)
+        f_ytdlp.pack(fill=tk.X, pady=3)
+        tk.Label(f_ytdlp, text="Motor de Download (yt-dlp.exe):", font=("Segoe UI", 9, "bold"), bg=COR_PRETO, fg=COR_BRANCO).pack(side=tk.LEFT)
+        cor_y = COR_VERDE_OK if tem_ytdlp else COR_VERMELHO
+        tk.Label(f_ytdlp, text="INSTALADO" if tem_ytdlp else "NÃO ENCONTRADO", font=("Segoe UI", 9, "bold"), bg=COR_PRETO, fg=cor_y).pack(side=tk.RIGHT)
+        
+        f_ff = tk.Frame(card_status, bg=COR_PRETO)
+        f_ff.pack(fill=tk.X, pady=3)
+        tk.Label(f_ff, text="Processador de Mídia (ffmpeg.exe):", font=("Segoe UI", 9, "bold"), bg=COR_PRETO, fg=COR_BRANCO).pack(side=tk.LEFT)
+        cor_f = COR_VERDE_OK if tem_ffmpeg else COR_VERMELHO
+        tk.Label(f_ff, text="INSTALADO" if tem_ffmpeg else "NÃO ENCONTRADO", font=("Segoe UI", 9, "bold"), bg=COR_PRETO, fg=cor_f).pack(side=tk.RIGHT)
+
+        f_deno = tk.Frame(card_status, bg=COR_PRETO)
+        f_deno.pack(fill=tk.X, pady=3)
+        tk.Label(f_deno, text="Motor JavaScript (deno.exe):", font=("Segoe UI", 9, "bold"), bg=COR_PRETO, fg=COR_BRANCO).pack(side=tk.LEFT)
+        cor_d = COR_VERDE_OK if tem_deno else COR_VERMELHO
+        tk.Label(f_deno, text="INSTALADO" if tem_deno else "NÃO ENCONTRADO", font=("Segoe UI", 9, "bold"), bg=COR_PRETO, fg=cor_d).pack(side=tk.RIGHT)
+        
+        tk.Label(corpo, text="OPÇÕES DE INSTALAÇÃO:", font=("Segoe UI", 10, "bold"), bg=COR_CONTAINER, fg=COR_AMARELO).pack(anchor="w", pady=(5, 6))
+        
+        txt_inst = tk.Text(corpo, bg=COR_PRETO, fg=COR_BRANCO, font=("Consolas", 8), height=8, relief=tk.FLAT)
+        txt_inst.pack(fill=tk.X, pady=(0, 10))
+        
+        if tem_ytdlp and tem_ffmpeg and tem_deno:
+            txt_inst.insert(tk.END, "Tudo certo! Nenhuma instalação adicional é necessária.")
+        else:
+            txt_inst.insert(tk.END, "[!] Dependências ausentes. Clique no botão abaixo para baixar.")
+            
+        def instalar_automatico():
+            btn_auto.config(state=tk.DISABLED, bg=COR_CONTAINER, fg=COR_CINZA_TEXTO, text="BAIXANDO COMPONENTES... AGUARDE")
+            btn_reinstalar.config(state=tk.DISABLED, bg=COR_CONTAINER, fg=COR_CINZA_TEXTO)
+            txt_inst.delete("1.0", tk.END)
+            
+            def worker():
+                def cb_log(msg):
+                    parent.after(0, lambda: txt_inst.insert(tk.END, msg))
+                    parent.after(0, lambda: txt_inst.see(tk.END))
+                
+                tem_yt = checar_executavel("yt-dlp")
+                tem_ff = checar_executavel("ffmpeg")
+                tem_dn = checar_executavel("deno")
+
+                sucesso, erro = instalar_motores_sistema(tem_yt, tem_ff, tem_dn, False, cb_log)
+                if sucesso:
+                    parent.after(0, lambda: txt_inst.insert(tk.END, "INSTALAÇÃO CONCLUÍDA!\n"))
+                    parent.after(0, lambda: txt_inst.see(tk.END))
+                    parent.after(0, lambda: btn_auto.config(text="TUDO INSTALADO AUTOMATICAMENTE"))
+                    parent.after(0, lambda: btn_reinstalar.config(state=tk.NORMAL, bg="#059669", fg=COR_BRANCO))
+                    parent.after(0, lambda: ModalMensagem.show(parent, "Sucesso", "Todas as dependências foram configuradas!", "info"))
+                else:
+                    parent.after(0, lambda: txt_inst.insert(tk.END, f"\n[!] Erro: {erro}"))
+                    parent.after(0, lambda: btn_auto.config(state=tk.NORMAL, text="TENTAR NOVAMENTE"))
+                    parent.after(0, lambda: btn_reinstalar.config(state=tk.NORMAL, bg="#059669", fg=COR_BRANCO))
+                    
+            threading.Thread(target=worker, daemon=True).start()
+
+        def forcar_reinstalacao():
+            if not ModalMensagem.ask_yes_no(parent, "Confirmar Reinstalação", "Isso apagará os motores atuais e baixará as versões mais recentes. Deseja continuar?"):
+                return
+            
+            btn_auto.config(state=tk.DISABLED, bg=COR_CONTAINER, fg=COR_CINZA_TEXTO)
+            btn_reinstalar.config(state=tk.DISABLED, bg=COR_CONTAINER, fg=COR_CINZA_TEXTO, text="LIMPANDO...")
+            txt_inst.delete("1.0", tk.END)
+            
+            def worker_reinstalar():
+                def cb_log(msg):
+                    parent.after(0, lambda: txt_inst.insert(tk.END, msg))
+                    parent.after(0, lambda: txt_inst.see(tk.END))
+                
+                sucesso, erro = instalar_motores_sistema(False, False, False, True, cb_log)
+                if sucesso:
+                    parent.after(0, lambda: txt_inst.insert(tk.END, "\nREINSTALAÇÃO CONCLUÍDA COM SUCESSO!\n"))
+                    parent.after(0, lambda: txt_inst.see(tk.END))
+                    parent.after(0, lambda: btn_reinstalar.config(state=tk.NORMAL, bg="#059669", fg=COR_BRANCO, text="BAIXAR NOVAMENTE (FORÇAR REINSTALAÇÃO)"))
+                    parent.after(0, lambda: btn_auto.config(state=tk.NORMAL, text="INSTALAR TUDO AUTOMATICAMENTE"))
+                    parent.after(0, lambda: ModalMensagem.show(parent, "Sucesso", "Motores reinstalados com as versões mais recentes!", "info"))
+                else:
+                    parent.after(0, lambda: txt_inst.insert(tk.END, f"\n[!] Erro na reinstalação: {erro}"))
+                    parent.after(0, lambda: btn_reinstalar.config(state=tk.NORMAL, bg="#059669", fg=COR_BRANCO, text="BAIXAR NOVAMENTE (FORÇAR REINSTALAÇÃO)"))
+                    parent.after(0, lambda: btn_auto.config(state=tk.NORMAL, text="INSTALAR TUDO AUTOMATICAMENTE"))
+                    
+            threading.Thread(target=worker_reinstalar, daemon=True).start()
+
+        btn_auto = tk.Button(corpo, text="INSTALAR TUDO AUTOMATICAMENTE", command=instalar_automatico, font=("Segoe UI", 10, "bold"), bg=COR_AMARELO, fg=COR_PRETO, activebackground=COR_AMARELO_HOVER, relief=tk.FLAT, cursor="hand2", pady=8)
+        btn_auto.pack(fill=tk.X, padx=60, pady=(0, 10))
+        
+        btn_reinstalar = tk.Button(corpo, text="BAIXAR NOVAMENTE (FORÇAR REINSTALAÇÃO)", command=forcar_reinstalacao, font=("Segoe UI", 9, "bold"), bg="#059669", fg=COR_BRANCO, activebackground="#047857", relief=tk.FLAT, cursor="hand2", pady=7)
+        btn_reinstalar.pack(fill=tk.X, padx=60, pady=(0, 10))
+        
+        tk.Button(corpo, text="FECHAR CONFIGURAÇÕES", command=janela.destroy, font=("Segoe UI", 9, "bold"), bg=COR_VERMELHO, fg=COR_BRANCO, activebackground="#B91C1C", relief=tk.FLAT, cursor="hand2", pady=4).pack(fill=tk.X, padx=60, pady=(10,0))
+        
+        janela.deiconify()
+
+#====================================================
+# FUNÇÕES AUXILIARES PARA O EASTER EGG (v6.4.0)
+#====================================================
+def _resource_path(nome_arquivo: str) -> str:
+    base = PASTA_BUNDLE if getattr(sys, 'frozen', False) else PASTA_APP
+    return os.path.join(base, nome_arquivo)
+
+def _duracao_wav_ms(caminho: str) -> int:
+    try:
+        import wave
+        with wave.open(caminho, 'rb') as w:
+            frames = w.getnframes()
+            rate = w.getframerate()
+            if rate > 0:
+                return int((frames / rate) * 1000)
+    except Exception:
+        pass
+    return 4000
+
+#====================================================
+# MODAL: SOBRE A MARCA (EASTER EGG - TERMINAL HACKER)
+#====================================================
+class ModalMarca:
+    ROTEIRO = [
+        {"acao": "digitar", "texto": "> inicializando interface de comando...", "tipo": "normal"},
+        {"acao": "pausa", "ms": 800},
+        {"acao": "digitar", "texto": "> pppd call provedor", "tipo": "cmd"},
+        {"acao": "som_espera", "som": "modem_ocupado.wav", "texto_pos": "> [ERRO] linha ocupada. handshake falhou."},
+        {"acao": "pausa", "ms": 1000},
+        {"acao": "digitar", "texto": "> droga... hoje está difícil conectar... vou tentar uma nova rota...", "tipo": "cmd"},
+        {"acao": "digitar", "texto": "> connect --proto=slip --retry", "tipo": "cmd"},
+        {"acao": "som_espera", "som": "modem_conectado.wav", "texto_pos": "> [OK] conexão estabelecida na porta 443."},
+        {"acao": "pausa", "ms": 1000},
+        {"acao": "digitar", "texto": "> wget https://hotmart.com/aulas/curso-x/video-aula-01.mp4", "tipo": "cmd"},
+        {"acao": "som_espera", "som": "modem_desconectado.wav", "texto_pos": "> [ERRO FATAL] conexão derrubada. bloqueio de servidor detectado."},
+        {"acao": "pausa", "ms": 1200},
+        {"acao": "digitar", "texto": "> o firewall deles é bom... preciso de uma solução infalível.", "tipo": "cmd"},
+        {"acao": "pausa", "ms": 1000},
+        {"acao": "digitar", "texto": "> connect --target=www.sussuarana.com --bypass-drm", "tipo": "cmd"},
+        {"acao": "som_espera", "som": "modem_conectado.wav", "texto_pos": "> [OK] túnel criptografado estável."},
+        {"acao": "pausa", "ms": 800},
+        {"acao": "digitar", "texto": "> firefox https://www.sussuarana.com/_apps", "tipo": "cmd"},
+        {"acao": "digitar", "texto": "> ls /apps/disponiveis", "tipo": "cmd"},
+        {"acao": "digitar", "texto": f"> down.exe       Pronto para uso", "tipo": "ok"},
+        {"acao": "pausa", "ms": 500},
+        {"acao": "digitar", "texto": "> ./down.exe --url=https://hotmart.com/aulas/curso-x/video-aula-01", "tipo": "cmd"},
+        {"acao": "progresso", "som": "sucesso.wav", "texto_pos": "> [OK] vídeo baixado: aula01.mp4 (245 MB)"},
+        {"acao": "pausa", "ms": 1000},
+        {"acao": "digitar", "texto": "> ./down.exe --url=https://kiwify.com/curso-y/audio-aula-01", "tipo": "cmd"},
+        {"acao": "progresso", "som": "sucesso.wav", "texto_pos": "> [OK] áudio baixado: aula01.mp3 (12 MB)"},
+        {"acao": "pausa", "ms": 1000},
+        {"acao": "digitar", "texto": "> ATÉ QUE ENFIM! FUNCIONOU PERFEITAMENTE!", "tipo": "ok"},
+        {"acao": "pausa", "ms": 1500},
+        {"acao": "digitar", "texto": "> ./down.exe --logout", "tipo": "cmd"},
+        {"acao": "digitar", "texto": "> exit", "tipo": "cmd"},
+        {"acao": "som_espera", "som": "modem_desconectado.wav", "texto_pos": "> conexão encerrada pelo usuário com sucesso."},
+        {"acao": "pausa", "ms": 1500},
+        {"acao": "limpar_tela"},
+        {"acao": "digitar", "texto": "--- DOWN v[VERSAO] ---", "tipo": "ok"},
+        {"acao": "digitar", "texto": "Desenvolvido por Swammy Léo Sussuarana", "tipo": "normal"},
+        {"acao": "digitar", "texto": "Sistemas de burla de DRM e extração de mídia.", "tipo": "normal"},
+        {"acao": "pausa", "ms": 1000},
+        {"acao": "digitar", "texto": "> reiniciando simulação em 5 segundos...", "tipo": "cmd"},
+        {"acao": "pausa", "ms": 5000}
+    ]
+
+    CORES = {
+        "cmd": COR_VERDE_MATRIX,
+        "erro": COR_VERMELHO,
+        "ok": COR_AMARELO,
+        "link": "#3B82F6",
+        "normal": COR_BRANCO
+    }
+
+    @staticmethod
+    def abrir(parent):
+        janela = tk.Toplevel(parent)
+        janela.withdraw()
+        janela.title(f"DOWN {VERSAO_ATUAL}")
+        janela.overrideredirect(True)
+        centralizar_janela(janela, 720, 600)
+        janela.configure(bg=COR_FUNDO)
+        janela.transient(parent)
+        janela.attributes("-topmost", True)
+        janela.grab_set()
+
+        canvas_logo = tk.Canvas(janela, width=720, height=260, bg=COR_FUNDO, highlightthickness=0)
+        canvas_logo.pack(fill=tk.X)
+
+        caminho_logo = obter_caminho_logo_png()
+        try:
+            img_pil_original = Image.open(caminho_logo).convert("RGBA")
+            img_pil_original = img_pil_original.resize((250, 250), Image.Resampling.LANCZOS)
+        except Exception:
+            img_pil_original = Image.new("RGBA", (250, 250), (255, 215, 0, 255))
+
+        tk_img = ImageTk.PhotoImage(img_pil_original)
+        logo_id = canvas_logo.create_image(360, 130, image=tk_img)
+        canvas_logo.create_rectangle(10, 10, 710, 250, outline=COR_AMARELO, width=2)
+
+        angulo = [0.0]
+        rodando = [True]
+
+        def animar_logo():
+            if not rodando[0]: return
+            angulo[0] = (angulo[0] + 10) % 360
+            rad = math.radians(angulo[0])
+            largura = max(1, int(250 * abs(math.cos(rad))))
+            img_red = img_pil_original.resize((largura, 250), Image.Resampling.LANCZOS)
+            nova_tk = ImageTk.PhotoImage(img_red)
+            canvas_logo.itemconfig(logo_id, image=nova_tk)
+            canvas_logo.image = nova_tk
+            janela.after(40, animar_logo)
+
+        frame_titulos = tk.Frame(janela, bg=COR_FUNDO)
+        frame_titulos.pack(fill=tk.X, pady=(5, 10))
+        tk.Label(frame_titulos, text=f"DOWN {VERSAO_ATUAL}", font=("Segoe UI", 20, "bold"), bg=COR_FUNDO, fg=COR_AMARELO).pack()
+        tk.Label(frame_titulos, text="Copyright (C) Out/2026 Swammy Léo Sussuarana", font=("Segoe UI", 8), bg=COR_FUNDO, fg=COR_BRANCO).pack()
+
+        canvas_terminal = tk.Canvas(janela, width=720, height=180, bg=COR_FUNDO, highlightthickness=0)
+        canvas_terminal.pack(fill=tk.BOTH, expand=True)
+
+        frame_btn = tk.Frame(janela, bg=COR_FUNDO)
+        frame_btn.pack(fill=tk.X, pady=15)
+        tk.Button(frame_btn, text="VOLTAR", command=lambda: on_close(), font=("Segoe UI", 10, "bold"), bg=COR_AMARELO, fg=COR_PRETO, activebackground=COR_AMARELO_HOVER, relief=tk.FLAT, cursor="hand2", pady=6, padx=40).pack()
+
+        estado = {"passo_idx": 0, "ativos": True, "afters": []}
+        linhas_na_tela = []
+        y_inicial = 20
+        espacamento = 22
+        max_linhas = 3
+
+        def agendar(ms, fn):
+            if not estado["ativos"]: return
+            aid = janela.after(ms, fn)
+            estado["afters"].append(aid)
+
+        def limpar_afters():
+            for aid in estado["afters"]:
+                try: janela.after_cancel(aid)
+                except: pass
+            estado["afters"].clear()
+
+        def tocar_wav(nome):
+            if not winsound or not nome: return
+            caminho = _resource_path(nome)
+            if not os.path.exists(caminho): return
+            try: winsound.PlaySound(caminho, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            except: pass
+
+        def adicionar_linha(texto, cor, piscar=False):
+            if len(linhas_na_tela) >= max_linhas:
+                primeiro = linhas_na_tela.pop(0)
+                canvas_terminal.delete(primeiro)
+                for i, item in enumerate(linhas_na_tela):
+                    canvas_terminal.coords(item, 20, y_inicial + (i * espacamento))
+            
+            y = y_inicial + (len(linhas_na_tela) * espacamento)
+            item = canvas_terminal.create_text(20, y, text=texto, anchor="nw", font=("Consolas", 10), fill=cor)
+            linhas_na_tela.append(item)
+            return item
+
+        def animar_digitacao(texto, cor, callback_fim):
+            item = adicionar_linha("", cor)
+            caminho_teclado = _resource_path("teclado.wav")
+            
+            def _type(idx):
+                if not estado["ativos"]: return
+                
+                if idx == 0 and winsound and os.path.exists(caminho_teclado):
+                    winsound.PlaySound(caminho_teclado, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP)
+
+                if idx <= len(texto):
+                    canvas_terminal.itemconfig(item, text=texto[:idx])
+                    agendar(40, lambda: _type(idx + 1)) 
+                else:
+                    if winsound: winsound.PlaySound(None, winsound.SND_PURGE)
+                    callback_fim()
+            _type(0)
+
+        def animar_progresso(callback_fim):
+            import random
+            item = adicionar_linha("> Estabelecendo fluxo de dados... 0%", COR_AMARELO)
+            
+            def _prog(pct):
+                if not estado["ativos"]: return
+                if pct < 100:
+                    canvas_terminal.itemconfig(item, text=f"> Baixando fragmentos... {pct}%")
+                    passo = random.randint(4, 15)
+                    agendar(150, lambda: _prog(min(100, pct + passo)))
+                else:
+                    canvas_terminal.itemconfig(item, text="> Processamento 100% concluído.")
+                    callback_fim()
+            _prog(0)
+
+        def proximo_passo():
+            if not estado["ativos"]: return
+            if estado["passo_idx"] >= len(ModalMarca.ROTEIRO):
+                estado["passo_idx"] = 0
+                canvas_terminal.delete("all")
+                linhas_na_tela.clear()
+                agendar(1000, proximo_passo)
+                return
+
+            passo = ModalMarca.ROTEIRO[estado["passo_idx"]]
+            estado["passo_idx"] += 1
+
+            if passo["acao"] == "digitar":
+                cor = ModalMarca.CORES.get(passo.get("tipo", "cmd"), COR_BRANCO)
+                texto_final = passo["texto"].replace("[VERSAO]", VERSAO_ATUAL)
+                animar_digitacao(texto_final, cor, lambda: agendar(200, proximo_passo))
+            
+            elif passo["acao"] == "limpar_tela":
+                canvas_terminal.delete("all")
+                linhas_na_tela.clear()
+                agendar(200, proximo_passo)
+
+            elif passo["acao"] == "pausa":
+                agendar(passo.get("ms", 1000), proximo_passo)
+            
+            elif passo["acao"] == "som_espera":
+                tocar_wav(passo["som"])
+                dur = _duracao_wav_ms(_resource_path(passo["som"]))
+                def apos_som():
+                    if passo.get("texto_pos"):
+                        cor_pos = COR_VERMELHO if "[ERRO" in passo["texto_pos"] else (COR_AMARELO if "[OK]" in passo["texto_pos"] else COR_VERDE_MATRIX)
+                        adicionar_linha(passo["texto_pos"], cor_pos)
+                    agendar(1000, proximo_passo)
+                agendar(dur + 500, apos_som)
+            
+            elif passo["acao"] == "progresso":
+                animar_progresso(lambda: [
+                    tocar_wav(passo["som"]),
+                    adicionar_linha(passo["texto_pos"], COR_AMARELO),
+                    agendar(1500, proximo_passo)
+                ])
+
+        def on_close():
+            estado["ativos"] = False
+            rodando[0] = False
+            limpar_afters()
+            try:
+                if winsound: winsound.PlaySound(None, winsound.SND_PURGE)
+            except: pass
+            try: janela.destroy()
+            except: pass
+
+        canvas_logo.tag_bind(logo_id, "<Button-1>", lambda e: on_close())
+        janela.protocol("WM_DELETE_WINDOW", on_close)
+
+        animar_logo()
+        janela.deiconify()
+        agendar(1000, proximo_passo)
+
+#====================================================
+# SPLASH SCREEN COM ANIMAÇÃO 3D FAKE E ATUALIZAÇÃO
+#====================================================
+class SplashScreen:
+    def __init__(self, root, callback_pronto):
+        self.root = root
+        self.callback_pronto = callback_pronto
+        self.tempo_restante = 10
+        self.rodando = True
+        self.motores_prontos = False
+        self.iniciou_contagem = False
+        
+        self.splash = tk.Toplevel(root)
+        self.splash.overrideredirect(True)
+        self.splash.configure(bg=COR_FUNDO)
+        centralizar_janela(self.splash, 720, 520)
+        
+        self.root.protocol("WM_DELETE_WINDOW", self.encerrar_splash)
+        
+        ico = obter_caminho_icone()
+        if ico:
+            try: self.splash.iconbitmap(ico)
+            except Exception: pass
+        
+        self.canvas = tk.Canvas(self.splash, width=720, height=310, bg=COR_FUNDO, highlightthickness=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+        
+        caminho_logo = obter_caminho_logo_png()
+        try:
+            self.img_pil_original = Image.open(caminho_logo).convert("RGBA")
+            self.img_pil_original = self.img_pil_original.resize((300, 300), Image.Resampling.LANCZOS)
+        except Exception:
+            self.img_pil_original = Image.new("RGBA", (300, 300), (255,215,0,255))
+            
+        self.tk_img = ImageTk.PhotoImage(self.img_pil_original)
+        self.logo_id = self.canvas.create_image(360, 155, image=self.tk_img)
+        
+        self.canvas.create_rectangle(10, 10, 710, 300, outline=COR_AMARELO, width=2)
+        
+        tk.Label(self.splash, text=f"DOWN {VERSAO_ATUAL}", font=("Segoe UI", 26, "bold"), bg=COR_FUNDO, fg=COR_AMARELO).pack()
+        tk.Label(self.splash, text="Copyright (C) Out/2026 Swammy Léo Sussuarana", font=("Segoe UI", 10), bg=COR_FUNDO, fg=COR_BRANCO).pack(pady=(2, 6))
+        
+        rodape = tk.Frame(self.splash, bg=COR_FUNDO, pady=10)
+        rodape.pack(fill=tk.X, padx=35)
+        
+        self.lbl_contador = tk.Label(rodape, text="Iniciando ecossistema...", font=("Segoe UI", 9, "bold"), bg=COR_FUNDO, fg=COR_AMARELO)
+        self.lbl_contador.pack(side=tk.LEFT)
+        
+        self.btn_pular = tk.Button(rodape, text="PULAR ABERTURA", command=self.encerrar_splash, font=("Segoe UI", 9, "bold"), bg=COR_AMARELO, fg=COR_PRETO, activebackground=COR_AMARELO_HOVER, relief=tk.FLAT, cursor="hand2", padx=16, pady=4)
+        
+        self.angulo = 0.0
+        self.velocidade = 20.0
+        self.animar_3d()
+        
+        threading.Thread(target=self.gerenciar_motores, daemon=True).start()
+
+    def animar_3d(self):
+        if not self.rodando: return
+        self.angulo = (self.angulo + self.velocidade) % 360
+        
+        radianos = math.radians(self.angulo)
+        escala_x = abs(math.cos(radianos))
+        largura_atual = max(1, int(300 * escala_x))
+        
+        img_redimensionada = self.img_pil_original.resize((largura_atual, 300), Image.Resampling.LANCZOS)
+        self.tk_img = ImageTk.PhotoImage(img_redimensionada)
+        self.canvas.itemconfig(self.logo_id, image=self.tk_img)
+        
+        if self.velocidade > 0.5:
+            self.velocidade *= 0.96
+            self.splash.after(30, self.animar_3d)
+        else:
+            self.tk_img = ImageTk.PhotoImage(self.img_pil_original)
+            self.canvas.itemconfig(self.logo_id, image=self.tk_img)
+
+    def gerenciar_motores(self):
+        try:
+            if self.rodando and self.splash.winfo_exists():
+                self.root.after(0, lambda: self.lbl_contador.config(text="Verificando motores do sistema (yt-dlp, ffmpeg, deno)...", fg=COR_AMARELO))
+            time.sleep(0.6)
+            
+            tem_ytdlp = checar_executavel("yt-dlp")
+            tem_ffmpeg = checar_executavel("ffmpeg")
+            tem_deno = checar_executavel("deno")
+            
+            if not self.rodando: return
+            
+            if not tem_ytdlp or not tem_ffmpeg or not tem_deno:
+                if self.splash.winfo_exists():
+                    self.root.after(0, lambda: self.lbl_contador.config(text="Configurando motores de download ausentes (Isto ocorre apenas 1 vez)...", fg=COR_AMARELO))
+                self.baixar_motores_ausentes(tem_ytdlp, tem_ffmpeg, tem_deno)
+            else:
+                self.atualizar_ytdlp()
+        except Exception:
+            pass
+        finally:
+            self.motores_prontos = True
+            if self.rodando and self.splash.winfo_exists():
+                self.root.after(0, lambda: self.btn_pular.pack(side=tk.RIGHT))
+                self.root.after(0, self.iniciar_contagem)
+
+    def baixar_motores_ausentes(self, tem_ytdlp, tem_ffmpeg, tem_deno):
+        if not self.rodando: return
+
+        def cb_log(msg):
+            msg_low = msg.lower()
+            if "baixando" in msg_low:
+                if "yt-dlp" in msg_low:
+                    self.root.after(0, lambda: self.lbl_contador.config(text="Baixando motor yt-dlp.exe...", fg=COR_AMARELO))
+                elif "ffmpeg" in msg_low:
+                    self.root.after(0, lambda: self.lbl_contador.config(text="Baixando e extraindo motor ffmpeg.exe...", fg=COR_AMARELO))
+                elif "deno" in msg_low:
+                    self.root.after(0, lambda: self.lbl_contador.config(text="Baixando e extraindo motor deno.exe...", fg=COR_AMARELO))
+
+        sucesso, erro = instalar_motores_sistema(tem_ytdlp, tem_ffmpeg, tem_deno, False, cb_log)
+        
+        if sucesso:
+            if self.rodando and self.splash.winfo_exists():
+                self.root.after(0, lambda: self.lbl_contador.config(text="Motores configurados e atualizados com sucesso!", fg=COR_VERDE_OK))
+        else:
+            if self.rodando and self.splash.winfo_exists():
+                self.root.after(0, lambda: self.lbl_contador.config(text="Uma atualização/configuração dos motores não pôde ser realizada.", fg=COR_VERMELHO))
+        
+        time.sleep(2.0)
+
+    def atualizar_ytdlp(self):
+        try:
+            cmd = obter_comando("yt-dlp")
+            flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            
+            linhas_saida = []
+            def cb_linha(linha):
+                l = linha.strip().lower()
+                if l: linhas_saida.append(l)
+                
+            def cb_tick(seg_restante):
+                if self.splash.winfo_exists():
+                    self.root.after(0, lambda s=seg_restante: self.lbl_contador.config(
+                        text=f"Verificando e atualizando motor yt-dlp (aguarde {s}s)...",
+                        fg=COR_AMARELO
+                    ))
+
+            ok, rc = executar_processo(
+                cmd=[cmd, "-U"],
+                flags_criacao=flags,
+                capturar_saida=True,
+                on_linha=cb_linha,
+                is_cancelado_fn=lambda: not self.rodando,
+                timeout=15,
+                on_tick=cb_tick
+            )
+
+            texto_completo = " ".join(linhas_saida)
+            sucesso_update = (
+                ok and 
+                rc == 0 and 
+                ("up to date" in texto_completo or "updated" in texto_completo or "updating" in texto_completo or len(linhas_saida) > 0)
+            )
+
+            if self.rodando and self.splash.winfo_exists():
+                if sucesso_update:
+                    self.root.after(0, lambda: self.lbl_contador.config(
+                        text="Motores verificados e atualizados com sucesso!",
+                        fg=COR_VERDE_OK
+                    ))
+                else:
+                    self.root.after(0, lambda: self.lbl_contador.config(
+                        text="Aviso: A atualização dos motores não pôde ser realizada no tempo limite.",
+                        fg=COR_AMARELO
+                    ))
+            time.sleep(2.0)
+        except Exception:
+            if self.rodando and self.splash.winfo_exists():
+                self.root.after(0, lambda: self.lbl_contador.config(
+                    text="Aviso: A atualização dos motores não pôde ser realizada.",
+                    fg=COR_AMARELO
+                ))
+            time.sleep(2.0)
+
+    def iniciar_contagem(self):
+        if not self.rodando or not self.motores_prontos or self.iniciou_contagem:
+            return
+        self.iniciou_contagem = True
+        self.executar_passo_contagem()
+
+    def executar_passo_contagem(self):
+        if not self.rodando:
+            return
+        if self.tempo_restante > 0 and self.splash.winfo_exists():
+            t = self.tempo_restante
+            self.lbl_contador.config(text=f"Iniciando DOWN {VERSAO_ATUAL} em {t}s...", fg=COR_AMARELO)
+            self.tempo_restante -= 1
+            self.splash.after(1000, self.executar_passo_contagem)
+        else:
+            self.encerrar_splash()
+            
+    def encerrar_splash(self):
+        if not self.rodando: return
+        self.rodando = False
+        try:
+            self.splash.destroy()
+        except Exception:
+            pass
+        self.callback_pronto()
+
+#====================================================
+# MODAL DE AUTORIA & PNL (MANTIDO INTACTO)
+#====================================================
+class ModalAutor:
+    @staticmethod
+    def abrir(parent):
+        janela = tk.Toplevel(parent)
+        janela.withdraw()
+        janela.title("Sobre o Autor & Filosofia de Desenvolvimento")
+        janela.minsize(640, 580)
+        centralizar_janela(janela, 680, 640)
+        janela.configure(bg=COR_FUNDO)
+        janela.transient(parent)
+        janela.grab_set()
+        
+        ico = obter_caminho_icone()
+        if ico:
+            try: janela.iconbitmap(ico)
+            except Exception: pass
+        
+        corpo = tk.Frame(janela, bg=COR_CONTAINER, bd=1, relief=tk.SOLID, padx=25, pady=25)
+        corpo.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        
+        topo_frame = tk.Frame(corpo, bg=COR_CONTAINER)
+        topo_frame.pack(fill=tk.X, pady=(0, 15))
+
+        frame_titulo = tk.Frame(topo_frame, bg=COR_CONTAINER)
+        frame_titulo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(frame_titulo, text="TECNOLOGIA, PROPÓSITO E LIBERDADE", font=("Segoe UI", 16, "bold"), bg=COR_CONTAINER, fg=COR_AMARELO).pack(anchor="w")
+        tk.Label(frame_titulo, text="Desenvolvido por Swammy Léo Sussuarana", font=("Segoe UI", 11, "bold"), bg=COR_CONTAINER, fg=COR_BRANCO).pack(anchor="w", pady=(2, 0))
+
+        caminho_logo = obter_caminho_logo_png()
+        if caminho_logo:
+            try:
+                img_pil = Image.open(caminho_logo).convert("RGBA")
+                img_pil = img_pil.resize((60, 60), Image.Resampling.LANCZOS)
+                tk_img_logo = ImageTk.PhotoImage(img_pil)
+                lbl_logo = tk.Label(topo_frame, image=tk_img_logo, bg=COR_CONTAINER)
+                lbl_logo.image = tk_img_logo
+                lbl_logo.pack(side=tk.RIGHT, padx=(10, 0))
+                
+                lbl_versao = tk.Label(topo_frame, text=f"v{VERSAO_ATUAL}", font=("Segoe UI", 8, "bold"), bg=COR_CONTAINER, fg=COR_BRANCO)
+                lbl_versao.pack(side=tk.RIGHT, anchor="s", pady=(0, 5))
+            except Exception:
+                pass
+        
+        texto_pnl = (
+            "Você certamente reconhece o imenso valor do seu tempo e a importância de ter ferramentas "
+            "precisas, seguras e transparentes ao seu alcance. Quando a tecnologia é construída com "
+            "respeito e excelência, ela simplesmente funciona sem travas, sem cobranças ocultas e sem pegadinhas.\n\n"
+            f"O DOWN {VERSAO_ATUAL} foi criado sob esse exato princípio: servir ao seu aprendizado e maximizar seus estudos "
+            "com máxima velocidade e dignidade. Por isso, este software é, e continuará sendo, 100% GRATUITO PARA SEMPRE.\n\n"
+            "Se esta solução economizou seu tempo, facilitou sua rotina e gerou valor real na sua jornada, "
+            "você é convidado a exercer o princípio sagrado da Reciprocidade Consciente. Uma contribuição espontânea "
+            "é um gesto voluntário de honra mútua que fortalece a manutenção e o desenvolvimento contínuo de novas tecnologias livres."
+        )
+        txt_box = tk.Text(corpo, bg=COR_CONTAINER, fg="#CBD5E1", font=("Segoe UI", 9), relief=tk.FLAT, wrap=tk.WORD, height=14)
+        txt_box.insert(tk.END, texto_pnl)
+        txt_box.config(state=tk.DISABLED)
+        txt_box.pack(fill=tk.X, pady=(0, 15))
+        
+        tk.Button(corpo, text="FAZER UMA CONTRIBUIÇÃO VOLUNTÁRIA (MERCADO PAGO)", command=lambda: webbrowser.open("https://link.mercadopago.com.br/sussuarana"), font=("Segoe UI", 10, "bold"), bg=COR_AMARELO, fg=COR_PRETO, activebackground=COR_AMARELO_HOVER, relief=tk.FLAT, cursor="hand2", pady=8).pack(fill=tk.X, padx=60, pady=(0, 10))
+        tk.Button(corpo, text="FALAR COM O AUTOR NO WHATSAPP BUSINESS", command=lambda: webbrowser.open("https://wa.me/5561981951122"), font=("Segoe UI", 9, "bold"), bg="#059669", fg=COR_BRANCO, activebackground="#047857", relief=tk.FLAT, cursor="hand2", pady=7).pack(fill=tk.X, padx=60, pady=(0, 15))
+        tk.Button(corpo, text="FECHAR JANELA", command=janela.destroy, font=("Segoe UI", 9, "bold"), bg=COR_VERMELHO, fg=COR_BRANCO, activebackground="#B91C1C", relief=tk.FLAT, cursor="hand2", pady=4).pack(fill=tk.X, padx=60)
+        
+        janela.deiconify()
+
+#===========================================================
+# APLICAÇÃO PRINCIPAL: DOWN 7.0.5 (Executável: Down7.exe)
+#===========================================================
+VERSAO_ATUAL = "7.0.5"
+
+class DownloaderApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title(f"DOWN {VERSAO_ATUAL} - Swammy Léo Sussuarana")
+        self.root.minsize(400, 600)
+        self.root.configure(bg=COR_FUNDO)
+        centralizar_janela(self.root, 1280, 900)
+        
+        self.root.protocol("WM_DELETE_WINDOW", self.fechar_aplicativo)
+        
+        pasta_padrao_win = obter_pasta_downloads_windows()
+        self.formato_alvo = tk.StringVar(value="video")
+        
+        self.var_pasta_m = tk.StringVar(value=pasta_padrao_win)
+        self.var_nome_m = tk.StringVar(value="")
+        self.var_url_m = tk.StringVar(value="")
+        self.var_prog_m_texto = tk.StringVar(value="Pronto para transferir...")
+        
+        self.pasta_global_lote = tk.StringVar(value=pasta_padrao_win)
+        self.titulo_base_lote = tk.StringVar(value="")
+        self.slots_lote = []
+        self.var_prog_lote_txt = tk.StringVar(value="Lote aguardando preenchimento...")
+        
+        self.var_pasta_s = tk.StringVar(value=pasta_padrao_win)
+        self.var_nome_s = tk.StringVar(value="")
+        self.var_url_s = tk.StringVar(value="")
+        self.var_browser_s = tk.StringVar(value="chrome")
+        self.var_prog_s_texto = tk.StringVar(value="Aguardando link de investigação...")
+        
+        self.em_download_manual = False
+        self.em_download_lote = False
+        self.em_download_sherlock = False
+        self.cancelado = False
+        self.processos_ativos = {}
+        self.houve_erro_no_processo = False
+        self.pisca_estado = False
+        
+        self.img_pil_logo_real = None
+        caminho_logo = obter_caminho_logo_png()
+        try:
+            img = Image.open(caminho_logo).convert("RGBA")
+            self.img_pil_logo_real = img.resize((30, 30), Image.Resampling.LANCZOS)
+        except Exception: pass
+
+        self.angulo_anim = 0.0
+        
+        self.configurar_estilos()
+        self.construir_interface()
+        self.rodar_pisca_alertas_lote()
+        self.verificar_atualizacao()
+
+    def fechar_aplicativo(self):
+        self.cancelado = True
+        for p_list in self.processos_ativos.values():
+            for p in p_list:
+                try: p.kill()
+                except: pass
+        try:
+            self.root.destroy()
+        except: pass
+        os._exit(0)
+
+    def configurar_estilos(self):
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure("Custom.Horizontal.TProgressbar", troughcolor=COR_PRETO, background=COR_AMARELO, bordercolor=COR_CONTAINER, thickness=14)
+
+    def construir_interface(self):
+        header = tk.Frame(self.root, bg=COR_FUNDO, pady=10)
+        header.pack(fill=tk.X, padx=20)
+        
+        if self.img_pil_logo_real:
+            img_topo = self.img_pil_logo_real.resize((50, 50), Image.Resampling.LANCZOS)
+            self.tk_logo_topo = ImageTk.PhotoImage(img_topo)
+            lbl_logo_topo = tk.Label(header, image=self.tk_logo_topo, bg=COR_FUNDO, cursor="hand2")
+            lbl_logo_topo.pack(side=tk.LEFT)
+            lbl_logo_topo.bind("<Button-1>", lambda e: ModalAutor.abrir(self.root))
+            lbl_logo_topo.bind("<Button-3>", lambda e: ModalMarca.abrir(self.root))
+        else:
+            lbl_logo_topo = tk.Label(header, text="◆", font=("Segoe UI", 30), bg=COR_FUNDO, fg=COR_AMARELO, cursor="hand2")
+            lbl_logo_topo.pack(side=tk.LEFT)
+            lbl_logo_topo.bind("<Button-1>", lambda e: ModalAutor.abrir(self.root))
+            lbl_logo_topo.bind("<Button-3>", lambda e: ModalMarca.abrir(self.root))
+            
+        frame_textos = tk.Frame(header, bg=COR_FUNDO)
+        frame_textos.pack(side=tk.LEFT, padx=(10, 0))
+        tk.Label(frame_textos, text=f"DOWN {VERSAO_ATUAL}", font=("Segoe UI", 20, "bold"), bg=COR_FUNDO, fg=COR_AMARELO).pack(anchor="w")
+        tk.Label(frame_textos, text="Copyright (C) Out/2026 Swammy Léo Sussuarana", font=("Segoe UI", 9), bg=COR_FUNDO, fg=COR_BRANCO).pack(anchor="w")
+        
+        frame_acoes_topo = tk.Frame(header, bg=COR_FUNDO)
+        frame_acoes_topo.pack(side=tk.RIGHT)
+        self.btn_como_usar = tk.Button(frame_acoes_topo, text="COMO USAR", command=lambda: ModalComoUsar.abrir(self.root), font=("Segoe UI", 9, "bold"), bg=COR_CONTAINER, fg=COR_AMARELO, disabledforeground=COR_AMARELO, relief=tk.SOLID, bd=1, cursor="hand2", padx=12, pady=4)
+        self.btn_como_usar.pack(side=tk.LEFT, padx=(0, 6))
+        self.btn_configurar = tk.Button(frame_acoes_topo, text="CONFIGURAR", command=lambda: ModalConfigurar.abrir(self.root), font=("Segoe UI", 9, "bold"), bg=COR_CONTAINER, fg=COR_AMARELO, disabledforeground=COR_AMARELO, relief=tk.SOLID, bd=1, cursor="hand2", padx=12, pady=4)
+        self.btn_configurar.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_autor = tk.Button(frame_acoes_topo, text="⚙", command=lambda: ModalAutor.abrir(self.root), font=("Segoe UI", 12, "bold"), bg=COR_CONTAINER, fg=COR_AMARELO, disabledforeground=COR_AMARELO, relief=tk.FLAT, cursor="hand2", padx=12, pady=2)
+        self.btn_autor.pack(side=tk.LEFT, padx=(0, 8))
+        
+        tk.Button(frame_acoes_topo, text="X", command=self.fechar_aplicativo, font=("Segoe UI", 10, "bold"), bg=COR_VERMELHO, fg=COR_BRANCO, activebackground="#B91C1C", relief=tk.FLAT, cursor="hand2", padx=12, pady=2).pack(side=tk.LEFT)
+        
+        frame_abas = tk.Frame(self.root, bg=COR_FUNDO)
+        frame_abas.pack(fill=tk.X, padx=20, pady=(5, 5))
+        self.btn_aba_unico = tk.Button(frame_abas, text="ARQUIVO ÚNICO", command=self.mostrar_aba_unico, font=("Segoe UI", 9, "bold"), bg=COR_AMARELO, fg=COR_PRETO, disabledforeground=COR_PRETO, relief=tk.FLAT, cursor="hand2", padx=16, pady=6)
+        self.btn_aba_unico.pack(side=tk.LEFT, padx=(0, 5))
+        self.btn_aba_lote = tk.Button(frame_abas, text="DOWN POR LOTE", command=self.mostrar_aba_lote, font=("Segoe UI", 9, "bold"), bg=COR_CONTAINER, fg=COR_BRANCO, disabledforeground=COR_BRANCO, relief=tk.FLAT, cursor="hand2", padx=16, pady=6)
+        self.btn_aba_lote.pack(side=tk.LEFT, padx=(0, 5))
+        ###############################################################################################################
+        #################### BOTÃO DO SHERLOCK-DOWN - TEMPORARIAMENTE DESABILITADO - NÃO MEXER ########################
+        ###############################################################################################################
+        #
+        # Esse conjunto de linhas comentadas NÃO DEVE SER REMOVIDO DO CÓDIGO EM HIPÓTESE ALGUMA
+        # NÃO MUDE, NÃO REMOVA, NÃO ALTERE, NÃO SUBSTITUA
+        # O botão permanece instanciado para manter a integridade das chamadas internas, apenas não é exibido (.pack comentado).
+        self.btn_aba_sherlock = tk.Button(frame_abas, text="SHERLOCK-DOWN", command=self.mostrar_aba_sherlock, font=("Segoe UI", 9, "bold"), bg=COR_CONTAINER, fg=COR_BRANCO, disabledforeground=COR_BRANCO, relief=tk.FLAT, cursor="hand2", padx=16, pady=6)
+        # self.btn_aba_sherlock.pack(side=tk.LEFT)
+        #
+        ###############################################################################################################
+        ###############################################################################################################
+        ###############################################################################################################
+        
+        frame_formatos = tk.Frame(frame_abas, bg=COR_FUNDO)
+        frame_formatos.pack(side=tk.RIGHT)
+        tk.Label(frame_formatos, text="FORMATO DE SAÍDA:", font=("Segoe UI", 8, "bold"), bg=COR_FUNDO, fg=COR_BRANCO).pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_fmt_video = tk.Button(frame_formatos, text="VÍDEO : ON", command=self.set_formato_video, font=("Segoe UI", 8, "bold"), bg=COR_AMARELO, fg=COR_PRETO, disabledforeground=COR_PRETO, relief=tk.SOLID, bd=1, cursor="hand2", padx=12, pady=4)
+        self.btn_fmt_video.pack(side=tk.LEFT, padx=(0, 5))
+        self.btn_fmt_audio = tk.Button(frame_formatos, text="ÁUDIO : OFF", command=self.set_formato_audio, font=("Segoe UI", 8, "bold"), bg=COR_CONTAINER, fg=COR_BRANCO, disabledforeground=COR_BRANCO, relief=tk.SOLID, bd=1, cursor="hand2", padx=12, pady=4)
+        self.btn_fmt_audio.pack(side=tk.LEFT)
+        
+        self.painel_unico = tk.Frame(self.root, bg=COR_FUNDO)
+        self.painel_lote = tk.Frame(self.root, bg=COR_FUNDO)
+        self.painel_sherlock = tk.Frame(self.root, bg=COR_FUNDO)
+        
+        self.construir_painel_unico()
+        self.construir_painel_lote()
+        self.construir_painel_sherlock()
+        
+        self.mostrar_aba_unico()
+        
+        self.rodar_animacao_status()
+
+    def travar_interface(self):
+        self.btn_aba_unico.config(state=tk.DISABLED, disabledforeground=self.btn_aba_unico.cget("fg"))
+        self.btn_aba_lote.config(state=tk.DISABLED, disabledforeground=self.btn_aba_lote.cget("fg"))
+        self.btn_aba_sherlock.config(state=tk.DISABLED, disabledforeground=self.btn_aba_sherlock.cget("fg"))
+        self.btn_fmt_video.config(state=tk.DISABLED, disabledforeground=self.btn_fmt_video.cget("fg"))
+        self.btn_fmt_audio.config(state=tk.DISABLED, disabledforeground=self.btn_fmt_audio.cget("fg"))
+        self.btn_como_usar.config(state=tk.DISABLED)
+        self.btn_configurar.config(state=tk.DISABLED)
+        self.btn_autor.config(state=tk.DISABLED)
+
+    def destravar_interface(self):
+        self.btn_aba_unico.config(state=tk.NORMAL)
+        self.btn_aba_lote.config(state=tk.NORMAL)
+        self.btn_aba_sherlock.config(state=tk.NORMAL)
+        self.btn_fmt_video.config(state=tk.NORMAL)
+        self.btn_fmt_audio.config(state=tk.NORMAL)
+        self.btn_como_usar.config(state=tk.NORMAL)
+        self.btn_configurar.config(state=tk.NORMAL)
+        self.btn_autor.config(state=tk.NORMAL)
+
+    def set_formato_video(self):
+        self.formato_alvo.set("video")
+        self.btn_fmt_video.config(text="VÍDEO : ON", bg=COR_AMARELO, fg=COR_PRETO)
+        self.btn_fmt_audio.config(text="ÁUDIO : OFF", bg=COR_CONTAINER, fg=COR_BRANCO)
+
+    def set_formato_audio(self):
+        self.formato_alvo.set("audio")
+        self.btn_fmt_video.config(text="VÍDEO : OFF", bg=COR_CONTAINER, fg=COR_BRANCO)
+        self.btn_fmt_audio.config(text="ÁUDIO : ON", bg=COR_AMARELO, fg=COR_PRETO)
+
+    def mostrar_aba_unico(self):
+        self.painel_lote.pack_forget(); self.painel_sherlock.pack_forget()
+        self.painel_unico.pack(fill=tk.BOTH, expand=True, padx=20, pady=5)
+        self.btn_aba_unico.config(bg=COR_AMARELO, fg=COR_PRETO); self.btn_aba_lote.config(bg=COR_CONTAINER, fg=COR_BRANCO); self.btn_aba_sherlock.config(bg=COR_CONTAINER, fg=COR_BRANCO)
+
+    def mostrar_aba_lote(self):
+        self.painel_unico.pack_forget(); self.painel_sherlock.pack_forget()
+        self.painel_lote.pack(fill=tk.BOTH, expand=True, padx=20, pady=5)
+        self.btn_aba_lote.config(bg=COR_AMARELO, fg=COR_PRETO); self.btn_aba_unico.config(bg=COR_CONTAINER, fg=COR_BRANCO); self.btn_aba_sherlock.config(bg=COR_CONTAINER, fg=COR_BRANCO)
+
+    def mostrar_aba_sherlock(self):
+        self.painel_unico.pack_forget(); self.painel_lote.pack_forget()
+        self.painel_sherlock.pack(fill=tk.BOTH, expand=True, padx=20, pady=5)
+        self.btn_aba_sherlock.config(bg=COR_AMARELO, fg=COR_PRETO); self.btn_aba_unico.config(bg=COR_CONTAINER, fg=COR_BRANCO); self.btn_aba_lote.config(bg=COR_CONTAINER, fg=COR_BRANCO)
+
+    def rodar_animacao_status(self):
+        self.angulo_anim = (self.angulo_anim + 10) % 360
+        if self.img_pil_logo_real:
+            radianos = math.radians(self.angulo_anim)
+            escala = abs(math.cos(radianos))
+            largura = max(1, int(30 * escala))
+            img_red = self.img_pil_logo_real.resize((largura, 30), Image.Resampling.LANCZOS)
+            self.tk_logo_spin = ImageTk.PhotoImage(img_red)
+            
+            if self.em_download_manual:
+                self.cv_spin_m.itemconfig(self.img_id_m, image=self.tk_logo_spin)
+            if self.em_download_lote:
+                self.cv_spin_l.itemconfig(self.img_id_l, image=self.tk_logo_spin)
+            if self.em_download_sherlock:
+                self.cv_spin_s.itemconfig(self.img_id_s, image=self.tk_logo_spin)
+                
+        self.root.after(40, self.rodar_animacao_status)
+
+    def rodar_pisca_alertas_lote(self):
+        self.pisca_estado = not self.pisca_estado
+        for s in self.slots_lote:
+            if s.get("estado_atual") == "sucesso_com_erro":
+                s["aplicar_pisca"](self.pisca_estado)
+        self.root.after(550, self.rodar_pisca_alertas_lote)
+
+    def atualizar_estado_spinner(self, aba, visivel):
+        aba = aba.lower() # NORMALIZAÇÃO DE STRING: ALVO 6 CORRIGIDO
+        if aba == "manual":
+            if visivel: self.cv_spin_m.pack(side=tk.LEFT, padx=(0, 10))
+            else: self.cv_spin_m.pack_forget()
+        elif aba == "lote":
+            if visivel: self.cv_spin_l.pack(side=tk.LEFT, padx=(0, 10))
+            else: self.cv_spin_l.pack_forget()
+        elif aba == "sherlock":
+            if visivel: self.cv_spin_s.pack(side=tk.LEFT, padx=(0, 10))
+            else: self.cv_spin_s.pack_forget()
+
+    def verificar_atualizacao(self):
+        def _check():
+            try:
+                req = urllib.request.Request("https://www.sussuarana.com/versoes/versao_down.txt?t=" + str(int(time.time())), headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    linhas = response.read().decode('utf-8').strip().split('\n')
+                    if len(linhas) >= 2:
+                        v_remota = linhas[0].strip()
+                        url_down = linhas[1].strip()
+                        def parse_version(v): return tuple(map(int, re.sub(r'[^\d.]', '', v).split('.')))
+                        if parse_version(v_remota) > parse_version(VERSAO_ATUAL):
+                            self.root.after(1000, lambda: self.perguntar_atualizacao(v_remota, url_down))
+            except: pass
+        threading.Thread(target=_check, daemon=True).start()
+
+    def perguntar_atualizacao(self, v_remota, url_down):
+        msg = f"Uma nova versão ({v_remota}) do DOWN está disponível no servidor!\n\nDeseja descarregá-la agora?"
+        if ModalMensagem.ask_yes_no(self.root, "Atualização", msg):
+            destino = filedialog.asksaveasfilename(defaultextension=".exe", initialfile="Down7.exe", filetypes=[("Executável", "*.exe")])
+            if destino: self.baixar_atualizacao(url_down, destino)
+
+    def baixar_atualizacao(self, url, destino):
+        win_prog = tk.Toplevel(self.root)
+        win_prog.withdraw()
+        win_prog.title("A descarregar...")
+        centralizar_janela(win_prog, 400, 150)
+        win_prog.configure(bg=COR_FUNDO)
+        win_prog.transient(self.root)
+        win_prog.attributes("-topmost", True)
+        win_prog.grab_set()
+
+        tk.Label(win_prog, text="A transferir nova versão...", font=("Segoe UI", 10, "bold"), bg=COR_FUNDO, fg=COR_AMARELO).pack(pady=(20, 10))
+        bar = ttk.Progressbar(win_prog, style="Custom.Horizontal.TProgressbar", orient="horizontal", mode="determinate", maximum=100)
+        bar.pack(fill=tk.X, padx=20)
+        
+        win_prog.deiconify()
+        
+        def _dl():
+            try:
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=10) as response, open(destino, 'wb') as out_file:
+                    total_length = response.getheader('content-length')
+                    if total_length is None: out_file.write(response.read())
+                    else:
+                        total_length = int(total_length)
+                        downloaded = 0
+                        while True:
+                            buffer = response.read(8192)
+                            if not buffer: break
+                            downloaded += len(buffer)
+                            self.root.after(0, lambda p=int(downloaded * 100 / total_length): bar.configure(value=p))
+                self.root.after(0, win_prog.destroy)
+                self.root.after(0, lambda: ModalMensagem.show(self.root, "Concluído", f"Salvo em:\n{destino}\nPode abrir a nova versão.", "info"))
+            except Exception as e:
+                self.root.after(0, win_prog.destroy)
+                self.root.after(0, lambda err=str(e): ModalMensagem.show(self.root, "Erro", f"Falha na transferência:\n{err}", "erro"))
+        threading.Thread(target=_dl, daemon=True).start()
+
+    def cancelar_processo(self):
+        self.cancelado = True
+        self.atualizar_estado_spinner("manual", False)
+        self.atualizar_estado_spinner("lote", False)
+        self.atualizar_estado_spinner("sherlock", False)
+        for p_list in self.processos_ativos.values():
+            for p in p_list:
+                try: p.kill()
+                except: pass
+
+    def construir_painel_unico(self):
+        card = tk.Frame(self.painel_unico, bg=COR_CONTAINER, bd=1, relief=tk.SOLID, padx=20, pady=15)
+        card.pack(fill=tk.X, pady=4)
+        
+        tk.Label(card, text="DIRETÓRIO DE DESTINO:", font=("Segoe UI", 9, "bold"), bg=COR_CONTAINER, fg=COR_BRANCO).pack(anchor="w")
+        fp = tk.Frame(card, bg=COR_CONTAINER)
+        fp.pack(fill=tk.X, pady=(2, 10))
+        self.ent_pasta_m = tk.Entry(fp, textvariable=self.var_pasta_m, font=("Segoe UI", 10), bg=COR_PRETO, fg=COR_BRANCO, disabledbackground=COR_PRETO, disabledforeground=COR_BRANCO, insertbackground=COR_AMARELO, relief=tk.FLAT, bd=6)
+        self.ent_pasta_m.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.btn_pasta_m = tk.Button(fp, text="Procurar...", command=lambda: self.selecionar_pasta(self.var_pasta_m), font=("Segoe UI", 9, "bold"), bg=COR_AMARELO, fg=COR_PRETO, disabledforeground=COR_PRETO, relief=tk.FLAT, cursor="hand2", padx=12)
+        self.btn_pasta_m.pack(side=tk.RIGHT, padx=(8, 0))
+        
+        tk.Label(card, text="NOME DO ARQUIVO (Opcional):", font=("Segoe UI", 9, "bold"), bg=COR_CONTAINER, fg=COR_BRANCO).pack(anchor="w")
+        self.ent_nome_m = tk.Entry(card, font=("Segoe UI", 10), bg=COR_PRETO, fg=COR_PLACEHOLDER, disabledbackground=COR_PRETO, disabledforeground=COR_PLACEHOLDER, insertbackground=COR_AMARELO, relief=tk.FLAT, bd=6)
+        self.ent_nome_m.insert(0, PLACEHOLDER_NOME)
+        self.ent_nome_m.pack(fill=tk.X, pady=(2, 10))
+        self.ent_nome_m.bind("<FocusIn>", lambda e: self._foco_in(self.ent_nome_m))
+        self.ent_nome_m.bind("<FocusOut>", lambda e: self._foco_out(self.ent_nome_m))
+        
+        tk.Label(card, text="LINK DA ORIGEM (M3U8 / YOUTUBE / URL):", font=("Segoe UI", 9, "bold"), bg=COR_CONTAINER, fg=COR_AMARELO).pack(anchor="w")
+        self.ent_url_m = tk.Entry(card, textvariable=self.var_url_m, font=("Segoe UI", 10), bg=COR_PRETO, fg=COR_BRANCO, disabledbackground=COR_PRETO, disabledforeground=COR_BRANCO, insertbackground=COR_AMARELO, relief=tk.FLAT, bd=6)
+        self.ent_url_m.pack(fill=tk.X, pady=(2, 4))
+        
+        f_status_m = tk.Frame(self.painel_unico, bg=COR_FUNDO)
+        f_status_m.pack(anchor="w", pady=(8, 2))
+        
+        self.cv_spin_m = tk.Canvas(f_status_m, width=30, height=30, bg=COR_FUNDO, highlightthickness=0)
+        self.img_id_m = self.cv_spin_m.create_image(15, 15)
+        self.cv_spin_m.pack_forget() 
+        
+        tk.Label(f_status_m, textvariable=self.var_prog_m_texto, font=("Segoe UI", 10, "bold"), bg=COR_FUNDO, fg=COR_AMARELO).pack(side=tk.LEFT)
+        
+        self.bar_manual = ttk.Progressbar(self.painel_unico, style="Custom.Horizontal.TProgressbar", orient="horizontal", mode="determinate", maximum=100, value=0)
+        self.bar_manual.pack(fill=tk.X)
+        
+        self.frame_acoes_m = tk.Frame(self.painel_unico, bg=COR_FUNDO)
+        self.frame_acoes_m.pack(fill=tk.X, pady=10)
+        self.btn_download_m = tk.Button(self.frame_acoes_m, text="INICIAR DOWNLOAD UNITÁRIO", command=self.disparar_download_manual, font=("Segoe UI", 11, "bold"), bg=COR_AMARELO, fg=COR_PRETO, activebackground=COR_AMARELO_HOVER, relief=tk.FLAT, cursor="hand2", pady=8)
+        self.btn_download_m.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        self.btn_limpar_m = tk.Button(self.frame_acoes_m, text="LIMPAR", command=self.limpar_modo_manual, font=("Segoe UI", 10, "bold"), bg=COR_CONTAINER, fg=COR_BRANCO, disabledforeground=COR_BRANCO, relief=tk.SOLID, bd=1, cursor="hand2", padx=18, pady=8)
+        self.btn_limpar_m.pack(side=tk.RIGHT)
+        
+        self.frame_cancel_m = tk.Frame(self.painel_unico, bg=COR_FUNDO)
+        tk.Button(self.frame_cancel_m, text="CANCELAR PROCESSO", command=self.cancelar_processo, font=("Segoe UI", 11, "bold"), bg=COR_VERMELHO, fg=COR_BRANCO, activebackground="#B91C1C", relief=tk.FLAT, cursor="hand2", pady=8).pack(fill=tk.X)
+        self.frame_cancel_m.pack_forget()
+        
+        tk.Label(self.painel_unico, text="CONSOLE DE DETALHES", font=("Segoe UI", 8, "bold"), bg=COR_FUNDO, fg=COR_BRANCO).pack(anchor="w")
+        ft = tk.Frame(self.painel_unico, bg=COR_PRETO, bd=1, relief=tk.SOLID)
+        ft.pack(fill=tk.BOTH, expand=True, pady=(2, 10))
+        self.txt_log_m = tk.Text(ft, bg=COR_PRETO, fg="#D1D5DB", font=("Consolas", 8), relief=tk.FLAT, wrap=tk.WORD)
+        self.txt_log_m.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        sb = tk.Scrollbar(ft, command=self.txt_log_m.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.txt_log_m.config(yscrollcommand=sb.set)
+
+    def _foco_in(self, ent):
+        if ent.get() == PLACEHOLDER_NOME:
+            ent.delete(0, tk.END); ent.config(fg=COR_BRANCO, disabledforeground=COR_BRANCO)
+            
+    def _foco_out(self, ent):
+        if not ent.get().strip():
+            ent.insert(0, PLACEHOLDER_NOME); ent.config(fg=COR_PLACEHOLDER, disabledforeground=COR_PLACEHOLDER)
+
+    def limpar_modo_manual(self):
+        self.var_pasta_m.set(obter_pasta_downloads_windows())
+        self.ent_nome_m.delete(0, tk.END); self.ent_nome_m.insert(0, PLACEHOLDER_NOME); self.ent_nome_m.config(fg=COR_PLACEHOLDER, disabledforeground=COR_PLACEHOLDER)
+        self.var_url_m.set(""); self.var_prog_m_texto.set("Pronto para transferir...")
+        self.bar_manual.configure(value=0, mode="determinate")
+        self.txt_log_m.delete("1.0", tk.END)
+        self.atualizar_estado_spinner("manual", False)
+        self.frame_cancel_m.pack_forget(); self.frame_acoes_m.pack(fill=tk.X, pady=10)
+
+    def construir_painel_lote(self):
+        top_bar = tk.Frame(self.painel_lote, bg=COR_CONTAINER, bd=1, relief=tk.SOLID, padx=12, pady=6)
+        top_bar.pack(fill=tk.X, pady=(0, 4))
+        top_bar.columnconfigure(1, weight=1)
+        
+        tk.Label(top_bar, text="Pasta Padrão:", font=("Segoe UI", 8, "bold"), bg=COR_CONTAINER, fg=COR_BRANCO).grid(row=0, column=0, sticky="w", pady=3)
+        self.ent_pasta_global_lote = tk.Entry(top_bar, textvariable=self.pasta_global_lote, font=("Segoe UI", 8), bg=COR_PRETO, fg=COR_BRANCO, disabledbackground=COR_PRETO, disabledforeground=COR_BRANCO, relief=tk.FLAT, bd=3)
+        self.ent_pasta_global_lote.grid(row=0, column=1, sticky="we", padx=6, pady=3)
+        self.btn_procurar_pasta_lote = tk.Button(top_bar, text="Procurar...", command=lambda: self.selecionar_pasta(self.pasta_global_lote), font=("Segoe UI", 8, "bold"), bg=COR_AMARELO, fg=COR_PRETO, disabledforeground=COR_PRETO, relief=tk.FLAT, cursor="hand2")
+        self.btn_procurar_pasta_lote.grid(row=0, column=2, padx=(0, 6), pady=3, sticky="we")
+        self.btn_replicar_pasta_lote = tk.Button(top_bar, text="Replicar Pasta para Todos", command=self.replicar_pasta_lote, font=("Segoe UI", 8, "bold"), bg=COR_CONTAINER, fg=COR_AMARELO, disabledforeground=COR_AMARELO, relief=tk.SOLID, bd=1, cursor="hand2")
+        self.btn_replicar_pasta_lote.grid(row=0, column=3, pady=3, sticky="we")
+        
+        tk.Label(top_bar, text="Título Base:", font=("Segoe UI", 8, "bold"), bg=COR_CONTAINER, fg=COR_AMARELO).grid(row=1, column=0, sticky="w", pady=3)
+        self.ent_titulo_base_lote = tk.Entry(top_bar, textvariable=self.titulo_base_lote, font=("Segoe UI", 8), bg=COR_PRETO, fg=COR_BRANCO, disabledbackground=COR_PRETO, disabledforeground=COR_BRANCO, relief=tk.FLAT, bd=3)
+        self.ent_titulo_base_lote.grid(row=1, column=1, sticky="we", padx=6, pady=3)
+        self.btn_replicar_titulo_lote = tk.Button(top_bar, text="Replicar Título", command=self.replicar_titulo_lote, font=("Segoe UI", 8, "bold"), bg=COR_AMARELO, fg=COR_PRETO, disabledforeground=COR_PRETO, relief=tk.FLAT, cursor="hand2")
+        self.btn_replicar_titulo_lote.grid(row=1, column=2, padx=(0, 6), pady=3, sticky="we")
+        self.btn_limpar_lote_topo = tk.Button(top_bar, text="Limpar Lote", command=self.limpar_modo_lote, font=("Segoe UI", 8, "bold"), bg=COR_CONTAINER, fg=COR_BRANCO, disabledforeground=COR_BRANCO, relief=tk.SOLID, bd=1, cursor="hand2")
+        self.btn_limpar_lote_topo.grid(row=1, column=3, pady=3, sticky="we")
+        
+        grid_container = tk.Frame(self.painel_lote, bg=COR_FUNDO)
+        grid_container.pack(fill=tk.BOTH, expand=True)
+        grid_container.rowconfigure(0, weight=85)
+        grid_container.rowconfigure(1, weight=15)
+        grid_container.columnconfigure(0, weight=1)
+        
+        frame_scroll = tk.Frame(grid_container, bg=COR_FUNDO)
+        frame_scroll.grid(row=0, column=0, sticky="nsew", pady=(0, 2))
+        
+        self.canvas_slots = tk.Canvas(frame_scroll, bg=COR_FUNDO, highlightthickness=0)
+        scrollbar_lote = tk.Scrollbar(frame_scroll, orient="vertical", command=self.canvas_slots.yview)
+        
+        self.scrollable_frame = tk.Frame(self.canvas_slots, bg=COR_FUNDO)
+        self.scrollable_frame.bind("<Configure>", lambda e: self.canvas_slots.configure(scrollregion=self.canvas_slots.bbox("all")))
+        self.janela_canvas_id = self.canvas_slots.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.canvas_slots.bind("<Configure>", lambda e: self.canvas_slots.itemconfig(self.janela_canvas_id, width=e.width))
+        self.canvas_slots.configure(yscrollcommand=scrollbar_lote.set)
+        self.canvas_slots.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar_lote.pack(side=tk.RIGHT, fill=tk.Y)
+        self.canvas_slots.bind_all("<MouseWheel>", lambda e: self.canvas_slots.yview_scroll(int(-1 * (e.delta / 120)), "units") if self.canvas_slots.winfo_exists() else None)
+        
+        self.slots_lote = []
+        for i in range(1, 11):
+            self.slots_lote.append(self.criar_slot_lote(self.scrollable_frame, i))
+            
+        frame_baixo = tk.Frame(grid_container, bg=COR_FUNDO)
+        frame_baixo.grid(row=1, column=0, sticky="nsew", pady=(2, 2))
+        frame_baixo.rowconfigure(0, weight=1)
+        frame_baixo.columnconfigure(0, weight=8) 
+        frame_baixo.columnconfigure(1, weight=2) 
+        
+        painel_logs = tk.Frame(frame_baixo, bg=COR_FUNDO)
+        painel_logs.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        
+        self.painel_botoes_lote = tk.Frame(frame_baixo, bg=COR_FUNDO)
+        self.painel_botoes_lote.grid(row=0, column=1, sticky="nsew")
+        
+        f_status_l = tk.Frame(painel_logs, bg=COR_FUNDO)
+        f_status_l.pack(anchor="w")
+        
+        self.cv_spin_l = tk.Canvas(f_status_l, width=24, height=24, bg=COR_FUNDO, highlightthickness=0)
+        self.img_id_l = self.cv_spin_l.create_image(12, 12)
+        self.cv_spin_l.pack_forget()
+        
+        tk.Label(f_status_l, textvariable=self.var_prog_lote_txt, font=("Segoe UI", 9, "bold"), bg=COR_FUNDO, fg=COR_AMARELO).pack(side=tk.LEFT)
+        
+        self.bar_lote = ttk.Progressbar(painel_logs, style="Custom.Horizontal.TProgressbar", orient="horizontal", mode="determinate", maximum=100, value=0)
+        self.bar_lote.pack(fill=tk.X, pady=(2, 5))
+        
+        frame_txt_lote = tk.Frame(painel_logs, bg=COR_PRETO, bd=1, relief=tk.SOLID)
+        frame_txt_lote.pack(fill=tk.BOTH, expand=True)
+        
+        self.txt_log_l = tk.Text(frame_txt_lote, bg=COR_PRETO, fg="#D1D5DB", font=("Consolas", 8), relief=tk.FLAT, wrap=tk.WORD, height=3)
+        self.txt_log_l.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=2)
+        sb_l = tk.Scrollbar(frame_txt_lote, command=self.txt_log_l.yview)
+        sb_l.pack(side=tk.RIGHT, fill=tk.Y)
+        self.txt_log_l.config(yscrollcommand=sb_l.set)
+
+        self.btn_download_lote = tk.Button(self.painel_botoes_lote, text="INICIAR\nEM LOTE", command=self.disparar_download_lote, font=("Segoe UI", 9, "bold"), bg=COR_AMARELO, fg=COR_PRETO, activebackground=COR_AMARELO_HOVER, relief=tk.FLAT, cursor="hand2", pady=10)
+        self.btn_download_lote.pack(fill=tk.X, pady=(15, 5))
+
+        self.btn_limpar_lote_baixo = tk.Button(self.painel_botoes_lote, text="LIMPAR TODO LOTE", command=self.limpar_modo_lote, font=("Segoe UI", 8, "bold"), bg=COR_CONTAINER, fg=COR_BRANCO, disabledforeground=COR_BRANCO, relief=tk.SOLID, bd=1, cursor="hand2", pady=6)
+        self.btn_limpar_lote_baixo.pack(fill=tk.X)
+        
+        self.btn_cancelar_lote = tk.Button(self.painel_botoes_lote, text="CANCELAR\nPROCESSO", command=self.cancelar_processo, font=("Segoe UI", 9, "bold"), bg=COR_VERMELHO, fg=COR_BRANCO, activebackground="#B91C1C", relief=tk.FLAT, cursor="hand2", pady=12)
+        self.btn_cancelar_lote.pack_forget()
+        
+        tk.Label(self.painel_lote, text="⚠️ AVISO: Plataformas blindadas podem bloquear acessos simultâneos excessivos.", font=("Segoe UI", 7, "bold"), bg=COR_FUNDO, fg=COR_PLACEHOLDER).pack(side=tk.BOTTOM, pady=(5, 0))
+
+    def criar_slot_lote(self, parent, indice: int) -> dict:
+        box = tk.Frame(parent, bg=COR_CONTAINER, highlightthickness=1, highlightbackground=COR_PLACEHOLDER, highlightcolor=COR_PLACEHOLDER, bd=0, padx=10, pady=6)
+        box.pack(fill=tk.X, pady=3, padx=4)
+        
+        v_ativo = tk.BooleanVar(value=False); v_url = tk.StringVar(value="")
+        v_pasta = tk.StringVar(value=self.pasta_global_lote.get())
+        v_status_bola = tk.StringVar(value="Pendente")
+        v_status_inline = tk.StringVar(value="Pendente")
+        v_duracao = tk.StringVar(value="")
+        
+        linha1 = tk.Frame(box, bg=COR_CONTAINER)
+        linha1.pack(fill=tk.X)
+        chk_ativo = tk.Checkbutton(linha1, text=f"Item {indice:02d}", variable=v_ativo, font=("Segoe UI", 9, "bold"), bg=COR_CONTAINER, fg=COR_AMARELO, disabledforeground=COR_AMARELO, selectcolor=COR_PRETO, activebackground=COR_CONTAINER, activeforeground=COR_AMARELO)
+        chk_ativo.pack(side=tk.LEFT, padx=(0, 8))
+        
+        fs = tk.Frame(linha1, bg=COR_CONTAINER)
+        fs.pack(side=tk.RIGHT, fill=tk.Y, padx=(6, 0))
+        lbl_s = tk.Label(fs, textvariable=v_status_bola, font=("Segoe UI", 8, "bold"), bg=COR_CONTAINER, fg=COR_CINZA_TEXTO)
+        lbl_s.pack(side=tk.LEFT, anchor="e")
+        cv_status = tk.Canvas(fs, width=30, height=30, bg=COR_CONTAINER, highlightthickness=0)
+        cv_status.pack(side=tk.RIGHT, anchor="e", pady=(2, 0), padx=(4,0))
+        
+        f_campos = tk.Frame(linha1, bg=COR_CONTAINER)
+        f_campos.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        f_nome = tk.Frame(f_campos, bg=COR_CONTAINER)
+        f_nome.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        tk.Label(f_nome, text="Nome do Arquivo (Opcional):", font=("Segoe UI", 8, "bold"), bg=COR_CONTAINER, fg=COR_BRANCO).pack(anchor="w")
+        ent_n = tk.Entry(f_nome, font=("Segoe UI", 9), bg=COR_PRETO, fg=COR_PLACEHOLDER, disabledbackground=COR_PRETO, disabledforeground=COR_PLACEHOLDER, insertbackground=COR_AMARELO, relief=tk.FLAT, bd=3)
+        ent_n.insert(0, PLACEHOLDER_NOME)
+        ent_n.pack(fill=tk.X, pady=(1, 0))
+        ent_n.bind("<FocusIn>", lambda e: self._foco_in(ent_n))
+        ent_n.bind("<FocusOut>", lambda e: self._foco_out(ent_n))
+        
+        f_pasta = tk.Frame(f_campos, bg=COR_CONTAINER)
+        f_pasta.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(f_pasta, text="Pasta de Destino:", font=("Segoe UI", 8, "bold"), bg=COR_CONTAINER, fg=COR_BRANCO).pack(anchor="w")
+        bx_p = tk.Frame(f_pasta, bg=COR_CONTAINER)
+        bx_p.pack(fill=tk.X, pady=(1, 0))
+        ent_p = tk.Entry(bx_p, textvariable=v_pasta, font=("Segoe UI", 8), bg=COR_PRETO, fg=COR_BRANCO, disabledbackground=COR_PRETO, disabledforeground=COR_BRANCO, insertbackground=COR_AMARELO, relief=tk.FLAT, bd=3)
+        ent_p.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        btn_p = tk.Button(bx_p, text="...", command=lambda v=v_pasta: self.selecionar_pasta(v), font=("Segoe UI", 7, "bold"), bg=COR_AMARELO, fg=COR_PRETO, disabledforeground=COR_PRETO, relief=tk.FLAT, cursor="hand2", padx=5)
+        btn_p.pack(side=tk.RIGHT, padx=(4, 0))
+        
+        linha2 = tk.Frame(box, bg=COR_CONTAINER)
+        linha2.pack(fill=tk.X, pady=(5, 1))
+        
+        f_l_u = tk.Frame(linha2, bg=COR_CONTAINER)
+        f_l_u.pack(fill=tk.X)
+        tk.Label(f_l_u, text="Link da Origem (URL):", font=("Segoe UI", 8, "bold"), bg=COR_CONTAINER, fg=COR_AMARELO).pack(side=tk.LEFT)
+        lbl_duracao = tk.Label(f_l_u, textvariable=v_duracao, font=("Segoe UI", 8, "bold"), bg=COR_CONTAINER, fg=COR_BRANCO)
+        lbl_duracao.pack(side=tk.LEFT, padx=(10, 10))
+        lbl_status_inline = tk.Label(f_l_u, textvariable=v_status_inline, font=("Segoe UI", 8, "bold"), bg=COR_CONTAINER, fg=COR_AMARELO)
+        lbl_status_inline.pack(side=tk.LEFT)
+        
+        bx_u = tk.Frame(linha2, bg=COR_CONTAINER)
+        bx_u.pack(fill=tk.X, pady=(1, 0))
+        ent_u = tk.Entry(bx_u, textvariable=v_url, font=("Segoe UI", 9), bg=COR_PRETO, fg=COR_BRANCO, disabledbackground=COR_PRETO, disabledforeground=COR_BRANCO, insertbackground=COR_AMARELO, relief=tk.FLAT, bd=4)
+        ent_u.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        slot_dict = {
+            "id": indice, "ativo": v_ativo, "chk_ativo": chk_ativo, "ent_nome": ent_n, "ent_pasta": ent_p, "btn_pasta": btn_p,
+            "ent_url": ent_u, "url": v_url, "pasta": v_pasta,
+            "status": v_status_bola, "status_inline": v_status_inline,
+            "lbl_status": lbl_s, "lbl_status_inline": lbl_status_inline, "duracao": v_duracao,
+            "box": box, "estado_atual": "vazio"
+        }
+
+        def desenhar_bolinha(glow, inner):
+            cv_status.delete("all")
+            cv_status.create_oval(2, 2, 28, 28, fill=glow, outline="")
+            cv_status.create_oval(5, 5, 25, 25, fill=COR_PRETO, outline="")
+            cv_status.create_oval(7, 7, 23, 23, fill=inner, outline="")
+            cv_status.create_oval(10, 10, 14, 13, fill="#FFFFFF", outline="")
+
+        def aplicar_pisca(fase_bool):
+            if slot_dict["estado_atual"] != "sucesso_com_erro":
+                return
+            cor_quadro_bola = COR_BRANCO if fase_bool else COR_VERDE_OK
+            box.config(highlightbackground=cor_quadro_bola, highlightcolor=cor_quadro_bola)
+            desenhar_bolinha(cor_quadro_bola, cor_quadro_bola)
+            cor_msg = COR_BRANCO if fase_bool else COR_VERMELHO
+            lbl_status_inline.config(fg=cor_msg)
+
+        def atualizar_visual(estado):
+            slot_dict["estado_atual"] = estado
+            if estado == "vazio" or estado == "pendente":
+                cb, glow, inner = COR_PLACEHOLDER, COR_PLACEHOLDER, "#333333"
+                box.config(highlightbackground=cb, highlightcolor=cb)
+                desenhar_bolinha(glow, inner)
+                lbl_status_inline.config(fg=COR_AMARELO)
+            elif estado == "baixando":
+                cb, glow, inner = COR_AMARELO, COR_AMARELO, COR_AMARELO
+                box.config(highlightbackground=cb, highlightcolor=cb)
+                desenhar_bolinha(glow, inner)
+                lbl_status_inline.config(fg=COR_AMARELO)
+            elif estado == "concluido":
+                cb, glow, inner = COR_VERDE_OK, COR_VERDE_OK, COR_VERDE_OK
+                box.config(highlightbackground=cb, highlightcolor=cb)
+                desenhar_bolinha(glow, inner)
+                lbl_status_inline.config(fg=COR_VERDE_OK)
+            elif estado == "sucesso_com_erro":
+                v_status_bola.set("")
+                v_status_inline.set("Presença de erros no processo mas o Download aconteceu com sucesso!")
+                aplicar_pisca(self.pisca_estado)
+            elif estado == "erro":
+                cb, glow, inner = COR_VERMELHO, COR_VERMELHO, COR_VERMELHO
+                box.config(highlightbackground=cb, highlightcolor=cb)
+                desenhar_bolinha(glow, inner)
+                lbl_status_inline.config(fg=COR_VERMELHO)
+            else:
+                cb, glow, inner = COR_PLACEHOLDER, COR_PLACEHOLDER, "#333333"
+                box.config(highlightbackground=cb, highlightcolor=cb)
+                desenhar_bolinha(glow, inner)
+
+        slot_dict["set_visual"] = atualizar_visual
+        slot_dict["aplicar_pisca"] = aplicar_pisca
+        atualizar_visual("vazio")
+        
+        def _limpar_slot():
+            v_ativo.set(False); ent_n.delete(0, tk.END); ent_n.insert(0, PLACEHOLDER_NOME); ent_n.config(fg=COR_PLACEHOLDER, disabledforeground=COR_PLACEHOLDER)
+            v_pasta.set(self.pasta_global_lote.get()); v_url.set("")
+            v_status_bola.set("Pendente"); v_status_inline.set("Pendente"); v_duracao.set("")
+            lbl_s.config(fg=COR_CINZA_TEXTO); lbl_status_inline.config(fg=COR_AMARELO)
+            atualizar_visual("vazio")
+            
+        btn_l = tk.Button(bx_u, text="🗑 LIMPAR", command=_limpar_slot, font=("Segoe UI", 8), bg=COR_PRETO, fg=COR_BRANCO, disabledforeground=COR_CINZA_TEXTO, relief=tk.FLAT, cursor="hand2", padx=6)
+        btn_l.pack(side=tk.RIGHT, padx=(6, 0))
+        slot_dict["btn_limpar"] = btn_l
+        
+        return slot_dict
+
+    def definir_estado_controles_lote(self, estado):
+        self.ent_pasta_global_lote.config(state=estado, disabledbackground=COR_PRETO, disabledforeground=COR_BRANCO)
+        self.btn_procurar_pasta_lote.config(state=estado)
+        self.btn_replicar_pasta_lote.config(state=estado)
+        self.ent_titulo_base_lote.config(state=estado, disabledbackground=COR_PRETO, disabledforeground=COR_BRANCO)
+        self.btn_replicar_titulo_lote.config(state=estado)
+        self.btn_limpar_lote_topo.config(state=estado)
+        self.btn_limpar_lote_baixo.config(state=estado)
+        for s in self.slots_lote:
+            cor_fg_nome = COR_PLACEHOLDER if s["ent_nome"].get() == PLACEHOLDER_NOME else COR_BRANCO
+            s["chk_ativo"].config(state=estado, disabledforeground=COR_AMARELO)
+            s["ent_nome"].config(state=estado, disabledbackground=COR_PRETO, disabledforeground=cor_fg_nome)
+            s["ent_pasta"].config(state=estado, disabledbackground=COR_PRETO, disabledforeground=COR_BRANCO)
+            s["btn_pasta"].config(state=estado)
+            s["ent_url"].config(state=estado, disabledbackground=COR_PRETO, disabledforeground=COR_BRANCO)
+            s["btn_limpar"].config(state=estado)
+
+    def replicar_pasta_lote(self):
+        for s in self.slots_lote: s["pasta"].set(self.pasta_global_lote.get())
+        ToastNotification.show(self.root, "Replicado", "O diretório foi aplicado.")
+
+    def replicar_titulo_lote(self):
+        t = self.titulo_base_lote.get().strip()
+        for s in self.slots_lote:
+            s["ent_nome"].delete(0, tk.END)
+            if t: s["ent_nome"].insert(0, t); s["ent_nome"].config(fg=COR_BRANCO, disabledforeground=COR_BRANCO)
+            else: s["ent_nome"].insert(0, PLACEHOLDER_NOME); s["ent_nome"].config(fg=COR_PLACEHOLDER, disabledforeground=COR_PLACEHOLDER)
+            s["ativo"].set(False)
+        ToastNotification.show(self.root, "Replicado", "Texto replicado.")
+
+    def limpar_modo_lote(self):
+        padrao = obter_pasta_downloads_windows()
+        self.pasta_global_lote.set(padrao); self.titulo_base_lote.set("")
+        for s in self.slots_lote:
+            s["ativo"].set(False); s["ent_nome"].delete(0, tk.END); s["ent_nome"].insert(0, PLACEHOLDER_NOME); s["ent_nome"].config(fg=COR_PLACEHOLDER, disabledforeground=COR_PLACEHOLDER)
+            s["url"].set(""); s["pasta"].set(padrao)
+            s["status"].set("Pendente"); s["status_inline"].set("Pendente"); s["duracao"].set("")
+            s["lbl_status"].config(fg=COR_CINZA_TEXTO); s["lbl_status_inline"].config(fg=COR_AMARELO)
+            s["set_visual"]("vazio")
+        self.var_prog_lote_txt.set("Lote aguardando preenchimento...")
+        self.bar_lote.configure(value=0, mode="determinate")
+        self.txt_log_l.delete("1.0", tk.END)
+        self.atualizar_estado_spinner("lote", False)
+        self.canvas_slots.yview_moveto(0)
+
+    def construir_painel_sherlock(self):
+        card = tk.Frame(self.painel_sherlock, bg=COR_CONTAINER, bd=1, relief=tk.SOLID, padx=20, pady=15)
+        card.pack(fill=tk.X, pady=4)
+        
+        tk.Label(card, text="🕵️‍♂️ SHERLOCK-DOWN: RASTREAMENTO INTELIGENTE", font=("Segoe UI", 12, "bold"), bg=COR_CONTAINER, fg=COR_AMARELO).pack(anchor="w", pady=(0, 15))
+        
+        tk.Label(card, text="DIRETÓRIO DE DESTINO:", font=("Segoe UI", 9, "bold"), bg=COR_CONTAINER, fg=COR_BRANCO).pack(anchor="w")
+        fp = tk.Frame(card, bg=COR_CONTAINER)
+        fp.pack(fill=tk.X, pady=(2, 10))
+        self.ent_pasta_s = tk.Entry(fp, textvariable=self.var_pasta_s, font=("Segoe UI", 10), bg=COR_PRETO, fg=COR_BRANCO, disabledbackground=COR_PRETO, disabledforeground=COR_BRANCO, insertbackground=COR_AMARELO, relief=tk.FLAT, bd=6)
+        self.ent_pasta_s.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.btn_pasta_s = tk.Button(fp, text="Procurar...", command=lambda: self.selecionar_pasta(self.var_pasta_s), font=("Segoe UI", 9, "bold"), bg=COR_AMARELO, fg=COR_PRETO, disabledforeground=COR_PRETO, relief=tk.FLAT, cursor="hand2", padx=12)
+        self.btn_pasta_s.pack(side=tk.RIGHT, padx=(8, 0))
+        
+        tk.Label(card, text="NOME DO ARQUIVO (Opcional):", font=("Segoe UI", 9, "bold"), bg=COR_CONTAINER, fg=COR_BRANCO).pack(anchor="w")
+        self.ent_nome_s = tk.Entry(card, font=("Segoe UI", 10), bg=COR_PRETO, fg=COR_PLACEHOLDER, disabledbackground=COR_PRETO, disabledforeground=COR_PLACEHOLDER, insertbackground=COR_AMARELO, relief=tk.FLAT, bd=6)
+        self.ent_nome_s.insert(0, PLACEHOLDER_NOME)
+        self.ent_nome_s.pack(fill=tk.X, pady=(2, 10))
+        self.ent_nome_s.bind("<FocusIn>", lambda e: self._foco_in(self.ent_nome_s))
+        self.ent_nome_s.bind("<FocusOut>", lambda e: self._foco_out(self.ent_nome_s))
+        
+        tk.Label(card, text="NAVEGADOR PARA CLONAR SESSÃO:", font=("Segoe UI", 9, "bold"), bg=COR_CONTAINER, fg=COR_BRANCO).pack(anchor="w")
+        f_radios = tk.Frame(card, bg=COR_CONTAINER)
+        f_radios.pack(anchor="w", pady=(2, 10))
+        navs = [("Google Chrome", "chrome"), ("Microsoft Edge", "edge"), ("Mozilla Firefox", "firefox"), ("Brave Browser", "brave")]
+        for texto, valor in navs:
+            tk.Radiobutton(f_radios, text=texto, variable=self.var_browser_s, value=valor, font=("Segoe UI", 9), bg=COR_CONTAINER, fg=COR_AMARELO, selectcolor=COR_PRETO, activebackground=COR_CONTAINER, activeforeground=COR_AMARELO).pack(side=tk.LEFT, padx=(0, 15))
+            
+        tk.Label(card, text="LINK GERAL DA PÁGINA (Aba do Navegador):", font=("Segoe UI", 9, "bold"), bg=COR_CONTAINER, fg=COR_AMARELO).pack(anchor="w")
+        self.ent_url_s = tk.Entry(card, textvariable=self.var_url_s, font=("Segoe UI", 10), bg=COR_PRETO, fg=COR_BRANCO, disabledbackground=COR_PRETO, disabledforeground=COR_BRANCO, insertbackground=COR_AMARELO, relief=tk.FLAT, bd=6)
+        self.ent_url_s.pack(fill=tk.X, pady=(2, 4))
+        
+        f_status_s = tk.Frame(self.painel_sherlock, bg=COR_FUNDO)
+        f_status_s.pack(anchor="w", pady=(8, 2))
+        
+        self.cv_spin_s = tk.Canvas(f_status_s, width=30, height=30, bg=COR_FUNDO, highlightthickness=0)
+        self.img_id_s = self.cv_spin_s.create_image(15, 15)
+        self.cv_spin_s.pack_forget()
+        
+        tk.Label(f_status_s, textvariable=self.var_prog_s_texto, font=("Segoe UI", 10, "bold"), bg=COR_FUNDO, fg=COR_AMARELO).pack(side=tk.LEFT)
+        
+        self.bar_sherlock = ttk.Progressbar(self.painel_sherlock, style="Custom.Horizontal.TProgressbar", orient="horizontal", mode="determinate", maximum=100, value=0)
+        self.bar_sherlock.pack(fill=tk.X)
+        
+        self.frame_acoes_s = tk.Frame(self.painel_sherlock, bg=COR_FUNDO)
+        self.frame_acoes_s.pack(fill=tk.X, pady=10)
+        self.btn_download_s = tk.Button(self.frame_acoes_s, text="INVESTIGAR COM SHERLOCK-DOWN", command=self.disparar_sherlock, font=("Segoe UI", 11, "bold"), bg=COR_AMARELO, fg=COR_PRETO, activebackground=COR_AMARELO_HOVER, relief=tk.FLAT, cursor="hand2", pady=8)
+        self.btn_download_s.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        self.btn_limpar_s = tk.Button(self.frame_acoes_s, text="LIMPAR", command=self.limpar_modo_sherlock, font=("Segoe UI", 10, "bold"), bg=COR_CONTAINER, fg=COR_BRANCO, disabledforeground=COR_BRANCO, relief=tk.SOLID, bd=1, cursor="hand2", padx=18, pady=8)
+        self.btn_limpar_s.pack(side=tk.RIGHT)
+        
+        self.frame_cancel_s = tk.Frame(self.painel_sherlock, bg=COR_FUNDO)
+        self.btn_cancelar_s = tk.Button(self.frame_cancel_s, text="CANCELAR INVESTIGAÇÃO / PROCESSO", command=self.cancelar_processo, font=("Segoe UI", 11, "bold"), bg=COR_VERMELHO, fg=COR_BRANCO, activebackground="#B91C1C", relief=tk.FLAT, cursor="hand2", pady=8)
+        self.btn_cancelar_s.pack(fill=tk.X)
+        self.frame_cancel_s.pack_forget()
+        
+        tk.Label(self.painel_sherlock, text="CONSOLE DO SHERLOCK", font=("Segoe UI", 8, "bold"), bg=COR_FUNDO, fg=COR_BRANCO).pack(anchor="w")
+        ft = tk.Frame(self.painel_sherlock, bg=COR_PRETO, bd=1, relief=tk.SOLID)
+        ft.pack(fill=tk.BOTH, expand=True, pady=(2, 10))
+        self.txt_log_s = tk.Text(ft, bg=COR_PRETO, fg="#D1D5DB", font=("Consolas", 8), relief=tk.FLAT, wrap=tk.WORD)
+        self.txt_log_s.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        sb = tk.Scrollbar(ft, command=self.txt_log_s.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.txt_log_s.config(yscrollcommand=sb.set)
+
+    def limpar_modo_sherlock(self):
+        self.var_pasta_s.set(obter_pasta_downloads_windows())
+        self.ent_nome_s.delete(0, tk.END); self.ent_nome_s.insert(0, PLACEHOLDER_NOME); self.ent_nome_s.config(fg=COR_PLACEHOLDER, disabledforeground=COR_PLACEHOLDER)
+        self.var_url_s.set(""); self.var_browser_s.set("chrome")
+        self.var_prog_s_texto.set("Aguardando link de investigação...")
+        self.bar_sherlock.configure(value=0, mode="determinate")
+        self.txt_log_s.delete("1.0", tk.END)
+        self.atualizar_estado_spinner("sherlock", False)
+        self.frame_cancel_s.pack_forget()
+        self.frame_acoes_s.pack(fill=tk.X, pady=10)
+        self.ent_url_s.focus_set()
+
+    def selecionar_pasta(self, variavel):
+        c = filedialog.askdirectory(initialdir=variavel.get(), title="Selecione o Diretório")
+        if c: variavel.set(c)
+
+    def executar_download_item(self, id_sessao: str, pasta: str, nome: str, url: str, cb_progresso=None, cb_log=None, is_lote=False, is_sherlock=False, navegador=None) -> tuple:
+        houve_erro_local = False
+        
+        pasta = pasta.replace('\n', '').replace('\r', '').strip()
+        nome = nome.replace('\n', '').replace('\r', '').strip()
+        url = url.replace('\n', '').replace('\r', '').strip()
+        
+        os.makedirs(pasta, exist_ok=True)
+        formato_selecionado = self.formato_alvo.get()
+        ext_alvo = "mp3" if formato_selecionado == "audio" else "mp4"
+        
+        flags_criacao = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        cmd_ytdlp = obter_comando("yt-dlp")
+        cmd_ffmpeg = obter_comando("ffmpeg")
+        
+        eh_hotmart = "hotmart" in url.lower() or ".m3u8" in url.lower()
+        eh_youtube = "youtube.com" in url.lower() or "youtu.be" in url.lower()
+        eh_hls = ".m3u8" in url.lower() or "/hls/" in url.lower()
+        
+        base_args = []
+        if is_sherlock and navegador:
+            base_args = ["--cookies-from-browser", navegador]
+        elif eh_hotmart:
+            base_args = ["--referer", "https://hotmart.com/", "--add-header", "Origin: https://hotmart.com"]
+            
+        js_runtime_args = ["--js-runtimes", "deno"]
+        base_args.extend(js_runtime_args)
+
+        if cb_progresso and not is_sherlock: cb_progresso(0, "Obtendo informações do vídeo...")
+        
+        # a linha abaixo faz uma varredura em toda a playlist de vídeos se for link youtube de playlist
+        # esse procedimento faz com que o motor se perca e não consiga prosseguir dando a impressão de aplicativo travado
+        # adotamos uma linha alternativa que detecta que é playlist e trabalha apenas o vídeo em questão
+        # cmd_meta = [cmd_ytdlp, "--print", "%(duration_string)s||%(title)s"] + base_args + [url]
+        cmd_meta = [cmd_ytdlp, "--no-playlist", "--print", "%(duration_string)s||%(title)s"] + base_args + [url] 
+        proc_meta = subprocess.run(cmd_meta, capture_output=True, text=True, stdin=subprocess.DEVNULL, creationflags=flags_criacao)
+        
+        if proc_meta.returncode != 0:
+            err = proc_meta.stderr.lower()
+            if "locked" in err or "permission denied" in err or "locking" in err:
+                if cb_log: cb_log("[ERRO FATAL] O Navegador bloqueou o acesso físico ao arquivo de cookies.")
+                self.houve_erro_no_processo = True
+                return False, "", "", "LOCKED", True
+            else:
+                if is_sherlock:
+                    if cb_log: cb_log("[ERRO FATAL] Proteção DRM Detectada. Acesso Negado.")
+                    self.houve_erro_no_processo = True
+                    return False, "", "", "NOT_FOUND", True
+
+        meta_out = proc_meta.stdout.strip().split('||')
+        dur_str = meta_out[0] if len(meta_out) > 0 and meta_out[0] else ""
+        real_title = meta_out[1] if len(meta_out) > 1 and meta_out[1] else "Midia Original"
+        
+        nome_final = nome if nome and nome != PLACEHOLDER_NOME else real_title
+        nome_final = re.sub(r'[\\/*?:"<>|\n\r\t]', '', nome_final).strip()
+        arquivo_final = os.path.join(pasta, f"{nome_final}.{ext_alvo}")
+        
+        if cb_log: cb_log(f"-> Informações Obtidas: Arquivo='{nome_final}.{ext_alvo}', Duração='{dur_str}'")
+        
+        if id_sessao not in self.processos_ativos: self.processos_ativos[id_sessao] = []
+        temp_dir = os.path.join(pasta, f".temp_down7_{id_sessao}_{int(time.time())}")
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        frag_count = "10" if (eh_youtube and is_lote) else ("16" if eh_youtube else ("3" if is_lote else "10"))
+        
+        def rodar_cmd(cmd, weight, start_pct):
+            nonlocal houve_erro_local
+            def cb_linha(linha):
+                nonlocal houve_erro_local
+                l = linha.strip()
+                if not l: return
+                if "HTTP Error 403: Forbidden" in l: l += " (Acesso negado/expirado)"
+                if "ERROR:" in l:
+                    houve_erro_local = True
+                    self.houve_erro_no_processo = True
+                    if cb_log: cb_log(f"[ERRO DETECTADO] {l}")
+                
+                is_prog = bool(re.search(r'\[download\]\s+(\d+\.?\d*)%', l))
+                ignorar_no_log = is_prog and ("ETA" in l or "frag" in l) and "Destination:" not in l
+                
+                if cb_progresso and is_prog:
+                    match = re.search(r'\[download\]\s+(\d+\.?\d*)%', l)
+                    if match:
+                        try:
+                            p = float(match.group(1))
+                            cb_progresso(start_pct + (p / 100.0 * weight), f"{p:.1f}%")
+                        except: pass
+                if cb_log and not ignorar_no_log: cb_log(l)
+
+            def cb_start(proc):
+                self.processos_ativos[id_sessao].append(proc)
+
+            ok, rc = executar_processo(
+                cmd=cmd,
+                flags_criacao=flags_criacao,
+                capturar_saida=True,
+                on_linha=cb_linha,
+                is_cancelado_fn=lambda: self.cancelado,
+                on_start=cb_start
+            )
+            return ok and rc == 0
+
+        def _executar_fluxo_extracao(seletor, extra_args, final_step_fn, start_p, weight_p, desc):
+            if cb_progresso: cb_progresso(start_p, desc)
+            cmd = [cmd_ytdlp, "--newline", "--no-playlist", "--concurrent-fragments", frag_count, "-f", seletor] + extra_args + base_args + [url]
+            ok = rodar_cmd(cmd, weight_p, start_p)
+            if ok and not self.cancelado and final_step_fn:
+                return final_step_fn()
+            return ok
+
+        try:
+            seletor_v = obter_seletor_formato_video(url)
+            seletor_a = obter_seletor_formato_audio(url)
+
+            def merge_audio():
+                if cb_progresso: cb_progresso(90, "Processando Áudio Final...")
+                try:
+                    audio_files = [os.path.join(temp_dir, f) for f in os.listdir(temp_dir) if f.startswith("audio.")]
+                    if audio_files:
+                        cmd_ff = [cmd_ffmpeg, "-y", "-i", audio_files[0], "-q:a", "0", arquivo_final]
+                        ok, rc = executar_processo(
+                            cmd=cmd_ff,
+                            flags_criacao=flags_criacao,
+                            capturar_saida=False,
+                            is_cancelado_fn=lambda: self.cancelado,
+                            on_start=lambda proc: self.processos_ativos[id_sessao].append(proc)
+                        )
+                        return ok and rc == 0
+                    return False
+                except: return False
+
+            def merge_video_audio():
+                if cb_progresso: cb_progresso(90, "Unindo Vídeo e Áudio...")
+                try:
+                    v_f = [os.path.join(temp_dir, f) for f in os.listdir(temp_dir) if f.startswith("video.")]
+                    a_f = [os.path.join(temp_dir, f) for f in os.listdir(temp_dir) if f.startswith("audio.")]
+                    if v_f and a_f:
+                        cmd_ff = [cmd_ffmpeg, "-y", "-i", v_f[0], "-i", a_f[0], "-c:v", "copy", "-c:a", "aac", arquivo_final]
+                        ok, rc = executar_processo(
+                            cmd=cmd_ff,
+                            flags_criacao=flags_criacao,
+                            capturar_saida=False,
+                            is_cancelado_fn=lambda: self.cancelado,
+                            on_start=lambda proc: self.processos_ativos[id_sessao].append(proc)
+                        )
+                        return ok and rc == 0
+                    return False
+                except: return False
+
+            def executar_fallback_unificado():
+                if cb_log: cb_log("-> Tentando modo unificado (arquivo único com A/V)...")
+                return _executar_fluxo_extracao("best", ["-o", arquivo_final], None, 0, 98, "Baixando Arquivo Único...")
+
+            if formato_selecionado == "audio":
+                _executar_fluxo_extracao(seletor_a, ["-o", os.path.join(temp_dir, "audio.%(ext)s")], merge_audio, 0, 90, "Baixando Áudio...")
+            else:
+                if eh_hls:
+                    ok_hls = _executar_fluxo_extracao("bestvideo+bestaudio/best", ["--merge-output-format", "mp4", "-o", arquivo_final], None, 0, 95, "Baixando Mídia HLS...")
+                    if not ok_hls and not self.cancelado:
+                        executar_fallback_unificado()
+                else:
+                    ok_v = _executar_fluxo_extracao(seletor_v, ["-o", os.path.join(temp_dir, "video.%(ext)s")], None, 0, 45, "Baixando Vídeo...")
+                    ok_a = _executar_fluxo_extracao(seletor_a, ["-o", os.path.join(temp_dir, "audio.%(ext)s")], None, 45, 45, "Baixando Áudio...")
+                    
+                    if ok_v and ok_a and not self.cancelado:
+                        merge_video_audio()
+                    elif not self.cancelado:
+                        executar_fallback_unificado()
+
+            arquivo_existe_valido = os.path.exists(arquivo_final) and os.path.getsize(arquivo_final) > 0
+            if not arquivo_existe_valido and not self.cancelado:
+                if cb_log: cb_log("-> [AUTO-CURA v6.3.4] Acionando Protocolo Camaleão Anti-403 (Higienização de URL, Referers de Player e Sessão)...")
+                if cb_progresso: cb_progresso(10, "Resgate Anti-403 em andamento...")
+
+                urls_candidatas = gerar_candidatos_url_hls(url)
+                referers_candidatos = [
+                    "https://player.hotmart.com/",
+                    "https://cf-embed.play.hotmart.com/",
+                    "https://hotmart.com/"
+                ]
+                navegadores_candidatos = [None, "chrome", "edge", "brave", "firefox"]
+                resgatado = False
+
+                for u_cand in urls_candidatas:
+                    if self.cancelado or resgatado: break
+                    for ref_cand in referers_candidatos:
+                        if self.cancelado or resgatado: break
+                        parsed_ref = urllib.parse.urlparse(ref_cand)
+                        origin_cand = f"{parsed_ref.scheme}://{parsed_ref.netloc}"
+
+                        for nav_cand in navegadores_candidatos:
+                            if self.cancelado or resgatado: break
+                            args_camaleao = [
+                                "--user-agent", USER_AGENT_PADRAO,
+                                "--referer", ref_cand,
+                                "--add-header", f"Origin: {origin_cand}",
+                                "--js-runtimes", "deno"
+                            ]
+                            if nav_cand:
+                                args_camaleao.extend(["--cookies-from-browser", nav_cand])
+
+                            if formato_selecionado == "audio":
+                                cmd_resg = [cmd_ytdlp, "--newline", "--no-playlist", "--concurrent-fragments", frag_count, "-x", "--audio-format", "mp3", "-o", arquivo_final] + args_camaleao + [u_cand]
+                            else:
+                                cmd_resg = [cmd_ytdlp, "--newline", "--no-playlist", "--concurrent-fragments", frag_count, "-f", "bestvideo+bestaudio/best", "--merge-output-format", "mp4", "-o", arquivo_final] + args_camaleao + [u_cand]
+
+                            if rodar_cmd(cmd_resg, 85, 10):
+                                if os.path.exists(arquivo_final) and os.path.getsize(arquivo_final) > 0:
+                                    resgatado = True
+                                    if cb_log: cb_log(f"-> [AUTO-CURA v6.3.4] Sucesso no resgate via Camaleão (Referer={ref_cand}, Nav={nav_cand or 'Padrão'})!")
+                                    break
+
+                        if not resgatado and not self.cancelado and (".m3u8" in u_cand.lower() or "/hls/" in u_cand.lower()):
+                            if cb_log: cb_log(f"-> [AUTO-CURA v6.3.4] Tentando captura direta de pacotes via FFmpeg ({ref_cand})...")
+                            if executar_resgate_ffmpeg_direto(
+                                cmd_ffmpeg, u_cand, arquivo_final, formato_selecionado,
+                                ref_cand, id_sessao, self.processos_ativos,
+                                lambda: self.cancelado, flags_criacao
+                            ):
+                                resgatado = True
+                                if cb_log: cb_log("-> [AUTO-CURA v6.3.4] Sucesso na captura direta via FFmpeg!")
+                                break
+
+            arquivo_existe_valido = os.path.exists(arquivo_final) and os.path.getsize(arquivo_final) > 0
+            if not arquivo_existe_valido:
+                return False, "", "", dur_str, True
+
+            if cb_progresso: cb_progresso(100, "Concluído")
+            return True, nome_final, ext_alvo, dur_str, houve_erro_local
+
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            self.processos_ativos.pop(id_sessao, None)
+
+    def disparar_download_manual(self):
+        if not checar_executavel("yt-dlp"): return ModalMensagem.show(self.root, "Erro", "Motores ausentes. Instale em CONFIGURAR.", "erro")
+        if self.em_download_manual or self.em_download_lote or self.em_download_sherlock: return ModalMensagem.show(self.root, "Aguarde", "Já existe um processo em andamento!", "aviso")
+            
+        p, n, u = self.var_pasta_m.get().strip(), self.ent_nome_m.get().strip(), self.var_url_m.get().strip()
+        if not p or not u: return ModalMensagem.show(self.root, "Erro", "Preencha a pasta e o link corretamente.", "erro")
+            
+        self.em_download_manual, self.cancelado = True, False
+        self.houve_erro_no_processo = False
+        self.travar_interface()
+        cor_fg_nome = COR_PLACEHOLDER if self.ent_nome_m.get() == PLACEHOLDER_NOME else COR_BRANCO
+        self.ent_pasta_m.config(state=tk.DISABLED, disabledbackground=COR_PRETO, disabledforeground=COR_BRANCO)
+        self.btn_pasta_m.config(state=tk.DISABLED)
+        self.ent_nome_m.config(state=tk.DISABLED, disabledbackground=COR_PRETO, disabledforeground=cor_fg_nome)
+        self.ent_url_m.config(state=tk.DISABLED, disabledbackground=COR_PRETO, disabledforeground=COR_BRANCO)
+        self.btn_limpar_m.config(state=tk.DISABLED)
+        self.frame_acoes_m.pack_forget()
+        self.frame_cancel_m.pack(fill=tk.X, pady=10)
+        self.txt_log_m.delete("1.0", tk.END)
+        self.txt_log_m.insert(tk.END, ">>> INICIANDO O PROCESSO...\n")
+        self.atualizar_estado_spinner("manual", True)
+        self.root.update_idletasks()
+        
+        def worker():
+            def cb_p(pct, msg):
+                self.root.after(0, lambda: self.bar_manual.configure(value=pct))
+                self.root.after(0, lambda: self.var_prog_m_texto.set(msg))
+                if pct >= 90 and pct < 100: self.root.after(0, lambda: self.bar_manual.configure(mode="indeterminate", value=0))
+            def cb_l(msg):
+                self.root.after(0, lambda: self.txt_log_m.insert(tk.END, msg + "\n"))
+                self.root.after(0, lambda: self.txt_log_m.see(tk.END))
+                
+            ok, nome_gerado, ext_gerada, _, houve_erro_item = self.executar_download_item("manual_1", p, n, u, cb_progresso=cb_p, cb_log=cb_l)
+            
+            self.em_download_manual = False
+            self.root.after(0, lambda: self.destravar_interface())
+            self.root.after(0, lambda: self.ent_pasta_m.config(state=tk.NORMAL))
+            self.root.after(0, lambda: self.btn_pasta_m.config(state=tk.NORMAL))
+            self.root.after(0, lambda: self.ent_nome_m.config(state=tk.NORMAL))
+            self.root.after(0, lambda: self.ent_url_m.config(state=tk.NORMAL))
+            self.root.after(0, lambda: self.atualizar_estado_spinner("manual", False))
+            self.root.after(0, lambda: self.bar_manual.configure(mode="determinate"))
+            self.root.after(0, lambda: self.frame_cancel_m.pack_forget())
+            self.root.after(0, lambda: self.frame_acoes_m.pack(fill=tk.X, pady=10))
+            self.root.after(0, lambda: self.btn_limpar_m.config(state=tk.NORMAL))
+            
+            if self.cancelado:
+                self.root.after(0, lambda: self.bar_manual.configure(value=0))
+                self.root.after(0, lambda: self.var_prog_m_texto.set("Processo Cancelado."))
+                return
+
+            def finalizar_ui_manual():
+                log_completo = self.txt_log_m.get("1.0", tk.END)
+                if ok and not houve_erro_item:
+                    self.bar_manual.configure(value=100)
+                    self.var_prog_m_texto.set("Transferência Concluída com Sucesso!")
+                    self.var_url_m.set("")
+                    ModalRelatorioSessao.abrir(self.root, "Arquivo Único", 1, 1, 0, 0, log_completo, [p])
+                elif ok and houve_erro_item:
+                    self.bar_manual.configure(value=100)
+                    self.var_prog_m_texto.set("Presença de erros no processo mas o Download aconteceu com sucesso!")
+                    self.var_url_m.set("")
+                    ModalRelatorioSessao.abrir(self.root, "Arquivo Único", 1, 0, 1, 0, log_completo, [p])
+                else:
+                    self.bar_manual.configure(value=0)
+                    self.var_prog_m_texto.set("Falha catastrófica detectada no processo.")
+                    ModalRelatorioSessao.abrir(self.root, "Arquivo Único", 1, 0, 0, 1, log_completo, [p])
+
+            self.root.after(0, finalizar_ui_manual)
+                
+        threading.Thread(target=worker, daemon=True).start()
+
+    def disparar_sherlock(self):
+        if not checar_executavel("yt-dlp"): return ModalMensagem.show(self.root, "Erro", "Motores ausentes. Instale em CONFIGURAR.", "erro")
+        if self.em_download_manual or self.em_download_lote or self.em_download_sherlock: return ModalMensagem.show(self.root, "Aguarde", "Já existe um processo em andamento!", "aviso")
+            
+        p, n, u, b = self.var_pasta_s.get().strip(), self.ent_nome_s.get().strip(), self.var_url_s.get().strip(), self.var_browser_s.get()
+        if not p or not u: return ModalMensagem.show(self.root, "Erro", "Preencha a pasta e o link corretamente.", "erro")
+            
+        self.em_download_sherlock, self.cancelado = True, False
+        self.houve_erro_no_processo = False
+        self.travar_interface()
+        cor_fg_nome = COR_PLACEHOLDER if self.ent_nome_s.get() == PLACEHOLDER_NOME else COR_BRANCO
+        self.ent_pasta_s.config(state=tk.DISABLED, disabledbackground=COR_PRETO, disabledforeground=COR_BRANCO)
+        self.btn_pasta_s.config(state=tk.DISABLED)
+        self.ent_nome_s.config(state=tk.DISABLED, disabledbackground=COR_PRETO, disabledforeground=cor_fg_nome)
+        self.ent_url_s.config(state=tk.DISABLED, disabledbackground=COR_PRETO, disabledforeground=COR_BRANCO)
+        self.btn_limpar_s.config(state=tk.DISABLED)
+        self.frame_acoes_s.pack_forget()
+        self.frame_cancel_s.pack(fill=tk.X, pady=10)
+        self.txt_log_s.delete("1.0", tk.END)
+        self.txt_log_s.insert(tk.END, ">>> INICIANDO PROTOCOLO SHERLOCK-DOWN...\n")
+        self.atualizar_estado_spinner("sherlock", True)
+        self.root.update_idletasks() 
+        
+        def worker():
+            def cb_p(pct, msg):
+                self.root.after(0, lambda: self.bar_sherlock.configure(value=pct))
+                self.root.after(0, lambda: self.var_prog_s_texto.set(msg))
+                if pct >= 90 and pct < 100: self.root.after(0, lambda: self.bar_sherlock.configure(mode="indeterminate", value=0))
+            def cb_l(msg):
+                self.root.after(0, lambda: self.txt_log_s.insert(tk.END, msg + "\n"))
+                self.root.after(0, lambda: self.txt_log_s.see(tk.END))
+                
+            cb_l("🕵️‍♂️ Iniciando motor investigativo...")
+            cb_p(5, "Iniciando motor investigativo...")
+            time.sleep(1.0)
+            if self.cancelado: return
+            
+            cb_l(f"[1/4] Clonando sessão do navegador {b}...")
+            cb_p(15, f"Lendo cookies ({b})...")
+            time.sleep(1.0)
+            if self.cancelado: return
+            
+            cb_l("[2/4] Acessando à plataforma...")
+            cb_p(25, "Acessando ao URL...")
+            time.sleep(1.0)
+            if self.cancelado: return
+            
+            cb_l("[3/4] Desencriptando a página...")
+            cb_p(35, "Analisando elementos visuais...")
+            time.sleep(1.0)
+            if self.cancelado: return
+            
+            cb_l("[4/4] Injetando tokens...")
+            cb_p(45, "Autorizando o acesso...")
+            time.sleep(1.0)
+            if self.cancelado: return
+            
+            ok, nome_gerado, ext_gerada, err_code, houve_erro_item = self.executar_download_item("sherlock_1", p, n, u, cb_progresso=cb_p, cb_log=cb_l, is_sherlock=True, navegador=b)
+            
+            self.em_download_sherlock = False
+            self.root.after(0, lambda: self.destravar_interface())
+            self.root.after(0, lambda: self.ent_pasta_s.config(state=tk.NORMAL))
+            self.root.after(0, lambda: self.btn_pasta_s.config(state=tk.NORMAL))
+            self.root.after(0, lambda: self.ent_nome_s.config(state=tk.NORMAL))
+            self.root.after(0, lambda: self.ent_url_s.config(state=tk.NORMAL))
+            self.root.after(0, lambda: self.atualizar_estado_spinner("sherlock", False))
+            self.root.after(0, lambda: self.bar_sherlock.configure(mode="determinate"))
+            self.root.after(0, lambda: self.frame_cancel_s.pack_forget())
+            self.root.after(0, lambda: self.frame_acoes_s.pack(fill=tk.X, pady=10))
+            self.root.after(0, lambda: self.btn_limpar_s.config(state=tk.NORMAL))
+            
+            if self.cancelado:
+                self.root.after(0, lambda: self.bar_sherlock.configure(value=0))
+                self.root.after(0, lambda: self.var_prog_s_texto.set("Investigação Cancelada."))
+                return
+
+            def finalizar_ui_sherlock():
+                log_completo = self.txt_log_s.get("1.0", tk.END)
+                if ok and not houve_erro_item:
+                    cb_l("\n[SUCESSO] Operação furtiva concluída.")
+                    self.bar_sherlock.configure(value=100)
+                    self.var_prog_s_texto.set("Transferência Concluída!")
+                    self.var_url_s.set("")
+                    ModalRelatorioSessao.abrir(self.root, "Sherlock-Down", 1, 1, 0, 0, log_completo, [p])
+                elif ok and houve_erro_item:
+                    cb_l("\n[SUCESSO COM AVISOS] Operação concluída após contornar erros de formato.")
+                    self.bar_sherlock.configure(value=100)
+                    self.var_prog_s_texto.set("Presença de erros no processo mas o Download aconteceu com sucesso!")
+                    self.var_url_s.set("")
+                    ModalRelatorioSessao.abrir(self.root, "Sherlock-Down", 1, 0, 1, 0, log_completo, [p])
+                else:
+                    self.bar_sherlock.configure(value=0)
+                    if err_code == "LOCKED":
+                        self.var_prog_s_texto.set("Navegador bloqueou a leitura.")
+                        ModalMensagem.show(self.root, "Navegador Bloqueado", "O seu navegador fechou as portas de segurança.\n\nPor favor, feche TODAS as janelas do seu navegador e clique em INVESTIGAR novamente.", "erro")
+                    elif err_code == "NOT_FOUND":
+                        self.var_prog_s_texto.set("Proteção DRM Criptografada Detectada.")
+                        msg_drm = "A plataforma bloqueou a extração direta devido a criptografia rigorosa (DRM) ou ofuscação avançada de código.\n\nPara contornar este bloqueio, utilize a aba ARQUIVO ÚNICO, tal como é ensinado no botão COMO USAR."
+                        ModalMensagem.show(self.root, "Proteção Elevada Detectada", msg_drm, "aviso")
+                    ModalRelatorioSessao.abrir(self.root, "Sherlock-Down", 1, 0, 0, 1, log_completo, [p])
+
+            self.root.after(0, finalizar_ui_sherlock)
+                
+        threading.Thread(target=worker, daemon=True).start()
+
+    def disparar_download_lote(self):
+        if not checar_executavel("yt-dlp"): return ModalMensagem.show(self.root, "Erro", "Motores ausentes. Instale em CONFIGURAR.", "erro")
+        if self.em_download_lote or self.em_download_manual or self.em_download_sherlock: return ModalMensagem.show(self.root, "Aguarde", "Processo em andamento!", "aviso")
+            
+        itens = [(s, s["pasta"].get().strip(), s["ent_nome"].get().strip(), s["url"].get().strip()) for s in self.slots_lote if s["ativo"].get() and s["url"].get().strip()]
+        if not itens:
+            for s in self.slots_lote:
+                if s["url"].get().strip():
+                    s["ativo"].set(True)
+                    itens.append((s, s["pasta"].get().strip(), s["ent_nome"].get().strip(), s["url"].get().strip()))
+                    
+        if not itens: return ModalMensagem.show(self.root, "Lote Vazio", "Preencha ao menos um link para iniciar o download em lote.", "aviso")
+            
+        self.em_download_lote, self.cancelado = True, False
+        self.houve_erro_no_processo = False
+        self.travar_interface()
+        self.definir_estado_controles_lote(tk.DISABLED)
+        self.atualizar_estado_spinner("lote", True)
+        self.var_prog_lote_txt.set(f"Processando {len(itens)} arquivo(s) do lote...")
+        self.txt_log_l.delete("1.0", tk.END)
+        self.txt_log_l.insert(tk.END, f">>> A INICIAR PROCESSAMENTO EM LOTE ({len(itens)} ITENS)...\n")
+        
+        self.btn_download_lote.pack_forget()
+        self.btn_limpar_lote_baixo.pack_forget()
+        self.btn_cancelar_lote.pack(fill=tk.X, pady=12)
+        self.root.update_idletasks()
+        
+        def worker_lote():
+            total = len(itens)
+            self.progresso_lote = {item[0]["id"]: 0.0 for item in itens}
+            resultados = {"limpos": 0, "sucesso_com_erro": 0, "erros": 0}
+            lock_res = threading.Lock()
+            
+            for item in itens:
+                self.root.after(0, lambda s=item[0]: s["set_visual"]("baixando"))
+            
+            def processar_item(slot, pasta, nome, url):
+                id_s = slot["id"]
+                self.root.after(0, lambda: slot["status"].set("Iniciando..."))
+                self.root.after(0, lambda: slot["status_inline"].set("Iniciando..."))
+                self.root.after(0, lambda: slot["lbl_status"].config(fg=COR_AMARELO))
+                
+                def cb_p(pct, det):
+                    self.progresso_lote[id_s] = pct
+                    prog_global = sum(self.progresso_lote.values()) / total
+                    if pct >= 90 and pct < 100: self.root.after(0, lambda: self.bar_lote.configure(mode="indeterminate", value=0))
+                    else: self.root.after(0, lambda: self.bar_lote.configure(mode="determinate", value=prog_global))
+                        
+                    if "Unindo" in det or "Processando" in det:
+                        self.root.after(0, lambda: slot["status"].set("Processando"))
+                        self.root.after(0, lambda: slot["status_inline"].set("Processando"))
+                    else:
+                        self.root.after(0, lambda: slot["status"].set(f"{det}"))
+                        self.root.after(0, lambda: slot["status_inline"].set(f"{det}"))
+                        
+                def cb_l(msg):
+                    tag_msg = f"[Item {id_s:02d}] {msg}"
+                    self.root.after(0, lambda: self.txt_log_l.insert(tk.END, tag_msg + "\n"))
+                    self.root.after(0, lambda: self.txt_log_l.see(tk.END))
+                    
+                ok, nb, ext, dur, houve_erro_item = self.executar_download_item(f"lote_{id_s}", pasta, nome, url, cb_progresso=cb_p, cb_log=cb_l, is_lote=True)
+                
+                if dur: self.root.after(0, lambda d=dur, sl=slot: sl["duracao"].set(f"Duração: {d}"))
+                
+                if self.cancelado:
+                    self.root.after(0, lambda: slot["status"].set("Cancelado"))
+                    self.root.after(0, lambda: slot["status_inline"].set("Cancelado"))
+                    self.root.after(0, lambda: slot["lbl_status"].config(fg=COR_CINZA_TEXTO))
+                    self.root.after(0, lambda: slot["set_visual"]("vazio"))
+                    return
+
+                if ok and not houve_erro_item:
+                    with lock_res:
+                        resultados["limpos"] += 1
+                    self.root.after(0, lambda: slot["status"].set("Concluído"))
+                    self.root.after(0, lambda: slot["status_inline"].set("Concluído com Sucesso!"))
+                    self.root.after(0, lambda: slot["lbl_status"].config(fg=COR_VERDE_OK))
+                    self.root.after(0, lambda: slot["url"].set(""))
+                    self.root.after(0, lambda: slot["set_visual"]("concluido"))
+                elif ok and houve_erro_item:
+                    with lock_res:
+                        resultados["sucesso_com_erro"] += 1
+                    self.root.after(0, lambda: slot["url"].set(""))
+                    self.root.after(0, lambda: slot["set_visual"]("sucesso_com_erro"))
+                else:
+                    with lock_res:
+                        resultados["erros"] += 1
+                    self.root.after(0, lambda: slot["status"].set("Erro"))
+                    self.root.after(0, lambda: slot["status_inline"].set("Erro: O Download falhou!"))
+                    self.root.after(0, lambda: slot["lbl_status"].config(fg=COR_VERMELHO))
+                    self.root.after(0, lambda: slot["set_visual"]("erro"))
+            
+            threads = [threading.Thread(target=processar_item, args=(item[0], item[1], item[2], item[3])) for item in itens]
+            for t in threads: t.start()
+            for t in threads: t.join()
+                
+            self.em_download_lote = False
+            self.root.after(0, lambda: self.destravar_interface())
+            self.root.after(0, lambda: self.definir_estado_controles_lote(tk.NORMAL))
+            self.root.after(0, lambda: self.atualizar_estado_spinner("lote", False))
+            self.root.after(0, lambda: self.bar_lote.configure(mode="determinate"))
+            self.root.after(0, lambda: self.btn_cancelar_lote.pack_forget())
+            self.root.after(0, lambda: self.btn_download_lote.pack(fill=tk.X, pady=(15, 5)))
+            self.root.after(0, lambda: self.btn_limpar_lote_baixo.pack(fill=tk.X))
+            
+            if self.cancelado:
+                self.root.after(0, lambda: self.bar_lote.configure(value=0))
+                self.root.after(0, lambda: self.var_prog_lote_txt.set("Cancelado."))
+                return
+
+            pastas_unicas = []
+            for item in itens:
+                p_dir = os.path.normpath(item[1])
+                if p_dir not in pastas_unicas:
+                    pastas_unicas.append(p_dir)
+
+            def finalizar_lote_ui():
+                self.bar_lote.configure(value=100)
+                self.var_prog_lote_txt.set(
+                    f"Lote Finalizado! ({resultados['limpos'] + resultados['sucesso_com_erro']} baixados de {total})"
+                )
+                log_completo = self.txt_log_l.get("1.0", tk.END)
+                ModalRelatorioSessao.abrir(
+                    self.root,
+                    "Download em Lote",
+                    total,
+                    resultados["limpos"],
+                    resultados["sucesso_com_erro"],
+                    resultados["erros"],
+                    log_completo,
+                    pastas_unicas
+                )
+
+            self.root.after(0, finalizar_lote_ui)
+            
+        threading.Thread(target=worker_lote, daemon=True).start()
+
+def iniciar_sistema():
+    if os.name == 'nt':
+        try:
+            import ctypes
+            app_id = f'sussuarana.down7.downloader.{VERSAO_ATUAL}'
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+        except: pass
+            
+    root = tk.Tk()
+    
+    caminho_png = obter_caminho_logo_png()
+    if caminho_png:
+        try:
+            img_icon = tk.PhotoImage(file=caminho_png)
+            root.iconphoto(True, img_icon)
+        except: pass
+        
+    root.withdraw()
+    def apos_splash():
+        centralizar_janela(root, 1280, 900)
+        root.deiconify()
+        root.lift()
+        root.focus_force()
+        DownloaderApp(root)
+        
+    SplashScreen(root, apos_splash)
+    root.mainloop()
+
+if __name__ == "__main__":
+    iniciar_sistema()
